@@ -32,7 +32,7 @@ type ApiResponse = {
   selectedModules?: ModuleItem[];
   schedule?: {
     seats: SeatCell[][];
-    rowData: Array<{ moduleName: string }>;
+    rowData: Array<{ id?: string; moduleName: string }>;
     rowCount: number;
     colCount: number;
     warnings: string[];
@@ -67,6 +67,12 @@ function isRotationalIntent(message: string): boolean {
   const value = message.toLowerCase();
   const keywords = ['rotation', 'rotational', 'schedule', 'scheduler', 'module', 'students', 'class'];
   return keywords.some((keyword) => value.includes(keyword));
+}
+
+/** Extract first 24-char Mongo ObjectId from a free-text message. */
+function extractClassIdFromMessage(message: string): string | null {
+  const match = message.match(/\b[a-fA-F0-9]{24}\b/);
+  return match ? match[0] : null;
 }
 
 function nextMessageId(): string {
@@ -114,6 +120,30 @@ function isScheduleTypeRetryMessage(assistantMessage: string): boolean {
   );
 }
 
+/**
+ * When step is awaiting_modules, most assistant text is only shown inside the inline picker.
+ * Capacity / validation replies must also appear as timeline bubbles so the flow reads
+ * user → assistant → user, not several user rows with no visible reply.
+ */
+function isAwaitingModulesTimelineAssistantSurface(raw: string): boolean {
+  const t = (raw ?? '').trim();
+  if (!t) return false;
+  if (isScheduleTypeRetryMessage(t)) return true;
+  if (/^great\b/i.test(t) && /\bhere are the\b/i.test(t)) return false;
+  if (/\bwhich kind of rotational schedule\b/i.test(t)) return false;
+  if (
+    /\b(current capacity|must fit across module rows|please increase module rows\b|one or more module ids are invalid|no modules selected)\b/i.test(
+      t,
+    )
+  ) {
+    return true;
+  }
+  if (/\bfor rotation 1\b/i.test(t) && /\bstudents\b/i.test(t) && /\bcapacity\b/i.test(t)) {
+    return true;
+  }
+  return false;
+}
+
 /** Intro paragraphs for the unified module picker (no numbered module lines). */
 function modulePickerIntroText(
   assistantMessage: string,
@@ -140,6 +170,11 @@ function modulePickerIntroText(
     if (isScheduleTypeRetry) {
       return lines;
     }
+    /** Capacity / module validation: full text is in the chat thread; keep the embed short. */
+    if (isAwaitingModulesTimelineAssistantSurface(raw) && !looksLikeScheduleTypePrompt) {
+      lines.push('Use the checklist below to change your selection, then tap Confirm selection again.');
+      return lines;
+    }
     lines.push(
       ...stripped
         .split(/\n{2,}/)
@@ -162,7 +197,7 @@ function assistantChunksAfterResponse(data: ApiResponse): string[] {
   }
   if (data.step === 'awaiting_modules') {
     const rawAwaitingModules = (data.assistantMessage ?? '').trim();
-    if (isScheduleTypeRetryMessage(rawAwaitingModules)) {
+    if (isAwaitingModulesTimelineAssistantSurface(rawAwaitingModules)) {
       return [stripNumberedListLines(rawAwaitingModules)];
     }
     return [];
@@ -226,6 +261,34 @@ function scheduleRotationColumnCount(schedule: NonNullable<ApiResponse['schedule
   return n > 0 ? n : 1;
 }
 
+/** Render primary module row followed immediately by its copy rows. */
+function scheduleRowDisplayOrder(schedule: NonNullable<ApiResponse['schedule']>): number[] {
+  const rows = schedule.rowData ?? [];
+  const primaryOrder: string[] = [];
+  const byPrimary = new Map<string, number[]>();
+  const fallbackPrimaryKey = (index: number) => `__row_${index}`;
+
+  for (let i = 0; i < rows.length; i += 1) {
+    const id = rows[i]?.id ?? '';
+    const copyMatch = id.match(/^(.*)::__copy_\d+(?:_\d+)?$/i);
+    const primaryKey = copyMatch ? copyMatch[1] : id || fallbackPrimaryKey(i);
+    if (!byPrimary.has(primaryKey)) {
+      byPrimary.set(primaryKey, []);
+      primaryOrder.push(primaryKey);
+    }
+    byPrimary.get(primaryKey)!.push(i);
+  }
+
+  const out: number[] = [];
+  for (const key of primaryOrder) {
+    const indices = byPrimary.get(key) ?? [];
+    const primary = indices.filter((idx) => !/::__copy_\d+(?:_\d+)?$/i.test(rows[idx]?.id ?? ''));
+    const copies = indices.filter((idx) => /::__copy_\d+(?:_\d+)?$/i.test(rows[idx]?.id ?? ''));
+    out.push(...primary, ...copies);
+  }
+  return out;
+}
+
 /** Nest interceptor may add statusCode/success/message; some proxies nest the body under `data`. */
 function unwrapAiRotationalPayload(raw: Record<string, unknown>): Record<string, unknown> {
   const nested = raw.data;
@@ -276,26 +339,50 @@ export default function App() {
   const [studentSelection, setStudentSelection] = useState<string[]>([]);
   const [moduleSelection, setModuleSelection] = useState<string[]>([]);
   const [scheduleTypeSelection, setScheduleTypeSelection] = useState<string>('');
-  const [copyEachModule, setCopyEachModule] = useState(true);
+  const [copyEachModule, setCopyEachModule] = useState(false);
+  const [copyModuleCount, setCopyModuleCount] = useState('1');
   const [error, setError] = useState('');
   const [chatMessages, setChatMessages] = useState<ChatMessage[]>([
     {
       id: nextMessageId(),
       role: 'assistant',
-      text: 'Hello! Ask to create a rotational schedule, then enter your class ID. For students and modules, one card each will show the numbered list and checkboxes together—you can also type in the chat if you prefer.',
+      text: 'Hello! Ask to create a rotational schedule, then enter your class ID. ',
     },
   ]);
 
   const threadEndRef = useRef<HTMLDivElement>(null);
   const schedulePanelRef = useRef<HTMLDivElement>(null);
+  /** Avoid double `scrollIntoView` in React Strict Mode for the same bubble. */
+  const moduleCapacityScrollDoneForMessageIdRef = useRef<string | null>(null);
 
   const appendMessages = useCallback((entries: Omit<ChatMessage, 'id'>[]) => {
     setChatMessages((prev) => [...prev, ...entries.map((e) => ({ ...e, id: nextMessageId() }))]);
   }, []);
 
   useEffect(() => {
+    const last = chatMessages[chatMessages.length - 1];
+    const lastId = last?.id ?? null;
+
+    const moduleTimelineError =
+      response?.step === 'awaiting_modules' &&
+      isAwaitingModulesTimelineAssistantSurface((response.assistantMessage ?? '').trim());
+
+    if (moduleTimelineError && last?.role === 'assistant' && lastId) {
+      if (moduleCapacityScrollDoneForMessageIdRef.current !== lastId) {
+        moduleCapacityScrollDoneForMessageIdRef.current = lastId;
+        requestAnimationFrame(() => {
+          document.getElementById(`chat-msg-${lastId}`)?.scrollIntoView({
+            behavior: 'smooth',
+            block: 'start',
+            inline: 'nearest',
+          });
+        });
+      }
+      return;
+    }
+
     threadEndRef.current?.scrollIntoView({ behavior: 'smooth' });
-  }, [chatMessages, loading]);
+  }, [chatMessages, loading, response?.step, response?.assistantMessage]);
 
   const selectedModuleIdsSig = (response?.selectedModules ?? []).map((m) => m.id).join('|');
   useEffect(() => {
@@ -305,6 +392,14 @@ export default function App() {
     setModuleSelection((response.selectedModules ?? []).map((m) => m.id));
   }, [response?.sessionId, response?.step, selectedModuleIdsSig]);
 
+  const selectedStudentIdsSig = (response?.selectedStudents ?? []).map((s) => s.id).join('|');
+  useEffect(() => {
+    if (response?.step !== 'awaiting_students') {
+      return;
+    }
+    setStudentSelection((response.selectedStudents ?? []).map((s) => s.id));
+  }, [response?.sessionId, response?.step, selectedStudentIdsSig]);
+
   /** Reset the schedule-type radio selection whenever the list or step changes. */
   const scheduleTypesSig = (response?.scheduleTypes ?? []).map((t) => t.id).join('|');
   const hasContentList = (response?.modules?.length ?? 0) > 0;
@@ -313,7 +408,10 @@ export default function App() {
   }, [response?.sessionId, response?.step, scheduleTypesSig, hasContentList]);
 
   const normalizedSchedule = response ? pickScheduleFromPayload(response) : null;
-  const displaySchedule = normalizedSchedule ?? (response?.step === 'completed' ? persistedSchedule : null);
+  /** Keep showing the last grid when reopening module pick after `completed` (API still sends the schedule). */
+  const displaySchedule =
+    normalizedSchedule ??
+    (response?.step === 'completed' || response?.step === 'awaiting_modules' ? persistedSchedule : null);
   useEffect(() => {
     if (displaySchedule) {
       schedulePanelRef.current?.scrollIntoView({ behavior: 'smooth', block: 'end' });
@@ -351,7 +449,8 @@ export default function App() {
       setPersistedSchedule((prev) => mergePersistedSchedule(data, prev));
       setStudentSelection([]);
       setModuleSelection([]);
-      setCopyEachModule(true);
+      setCopyEachModule(false);
+      setCopyModuleCount('1');
       appendMessages(
         nonEmptyChunks(assistantChunksAfterResponse(data)).map((text) => ({ role: 'assistant' as const, text })),
       );
@@ -415,6 +514,12 @@ export default function App() {
           ]);
           return;
         }
+        const inlineClassId = extractClassIdFromMessage(message);
+        if (inlineClassId) {
+          setSeedScheduleIntent('');
+          await startSession(inlineClassId, message);
+          return;
+        }
         setSeedScheduleIntent(message);
         setChatMode('awaiting_class_id');
         appendMessages([{ role: 'assistant', text: 'Please provide the class ID.' }]);
@@ -427,8 +532,9 @@ export default function App() {
     await sendMessage(message);
   }
 
-  function confirmStudentSelection() {
+  async function confirmStudentSelection() {
     if (!response || response.step !== 'awaiting_students') return;
+    if (loading) return;
     if (studentSelection.length === 0) return;
     const names = studentSelection
       .map((id) => response.students.find((s) => s.id === id)?.fullName ?? id)
@@ -441,13 +547,14 @@ export default function App() {
       },
     ]);
     const idsJson = JSON.stringify(studentSelection);
-    void sendMessage(
+    await sendMessage(
       `I confirm these students for the rotation: ${names.join(', ')}. Call select_students with studentIds exactly ${idsJson}, then continue the workflow.`,
     );
   }
 
-  function confirmScheduleTypeSelection() {
+  async function confirmScheduleTypeSelection() {
     if (!response || response.step !== 'awaiting_modules') return;
+    if (loading) return;
     const pickedId = scheduleTypeSelection;
     if (!pickedId) return;
     const picked = (response.scheduleTypes ?? []).find((t) => t.id === pickedId);
@@ -460,11 +567,12 @@ export default function App() {
       },
     ]);
     /** Send the human-readable name; backend resolver matches on name/type alias. */
-    void sendMessage(picked.name);
+    await sendMessage(picked.name);
   }
 
-  function confirmModuleSelection() {
+  async function confirmModuleSelection() {
     if (!response || response.step !== 'awaiting_modules') return;
+    if (loading) return;
     if (moduleSelection.length === 0) return;
     const names = moduleSelection
       .map((id) => response.modules.find((m) => m.id === id)?.name ?? id)
@@ -477,8 +585,12 @@ export default function App() {
       },
     ]);
     const idsJson = JSON.stringify(moduleSelection);
-    const copyPart = copyEachModule ? ' copyEachSelectedModule: true.' : '';
-    void sendMessage(
+    const parsedCopyCount = Number.parseInt(copyModuleCount, 10);
+    const normalizedCopyCount = Number.isInteger(parsedCopyCount) && parsedCopyCount > 0 ? parsedCopyCount : 1;
+    const copyPart = copyEachModule
+      ? ` copyEachSelectedModule: true. copyModuleCount: ${normalizedCopyCount}.`
+      : '';
+    await sendMessage(
       `I confirm these modules for the rotation: ${names.join(', ')}. Call select_modules with moduleIds exactly ${idsJson}.${copyPart} Then continue the workflow.`,
     );
   }
@@ -506,6 +618,7 @@ export default function App() {
   }
 
   const rotationCols = displaySchedule ? scheduleRotationColumnCount(displaySchedule) : 0;
+  const orderedScheduleRows = displaySchedule ? scheduleRowDisplayOrder(displaySchedule) : [];
   const scheduleWarnings = displaySchedule?.warnings ?? [];
 
   return (
@@ -517,6 +630,7 @@ export default function App() {
           {chatMessages.map((message) => (
             <div
               key={message.id}
+              id={`chat-msg-${message.id}`}
               className={`msg-row ${message.role === 'user' ? 'msg-row-user' : 'msg-row-assistant'}${message.isError ? ' msg-row-error' : ''}`}
             >
               <div className="msg-meta">{message.role === 'user' ? 'You' : 'Assistant'}</div>
@@ -534,22 +648,40 @@ export default function App() {
                     {para}
                   </p>
                 ))}
+                <div className="inline-pick-head" aria-hidden>
+                  <span className="inline-pick-head-num">#</span>
+                  <span className="inline-pick-head-ch"> </span>
+                  <span className="inline-pick-head-name">Student</span>
+                  <span className="inline-pick-head-selected">Selected</span>
+                </div>
                 <ul className="inline-pick-list inline-pick-list-numbered" aria-label="Students — tick to include">
-                  {response.students.map((student, index) => (
-                    <li key={student.id}>
-                      <label className="inline-pick-row inline-pick-row-numbered">
-                        <span className="inline-pick-number" aria-hidden>
-                          {index + 1}.
-                        </span>
-                        <input
-                          type="checkbox"
-                          checked={studentSelection.includes(student.id)}
-                          onChange={() => toggleId(student.id, studentSelection, setStudentSelection)}
-                        />
-                        <span className="inline-pick-name">{student.fullName}</span>
-                      </label>
-                    </li>
-                  ))}
+                  {response.students.map((student, index) => {
+                    const selected = studentSelection.includes(student.id);
+                    return (
+                      <li key={student.id}>
+                        <label className="inline-pick-row inline-pick-row-numbered inline-pick-row-modules">
+                          <span className="inline-pick-number" aria-hidden>
+                            {index + 1}.
+                          </span>
+                          <input
+                            type="checkbox"
+                            checked={selected}
+                            onChange={() => toggleId(student.id, studentSelection, setStudentSelection)}
+                          />
+                          <span className="inline-pick-name">{student.fullName}</span>
+                          <span className="inline-pick-selected-cell">
+                            {selected ? (
+                              <span className="inline-pick-selected-yes" title="Currently selected">
+                                Yes
+                              </span>
+                            ) : (
+                              <span className="inline-pick-selected-dash">—</span>
+                            )}
+                          </span>
+                        </label>
+                      </li>
+                    );
+                  })}
                 </ul>
                 <div className="bubble-actions">
                   <button
@@ -665,11 +797,33 @@ export default function App() {
                       />
                       <span>Copy module — Select if you need a copy module</span>
                     </label>
+                    <label className="copy-module-count" htmlFor="copy-module-count">
+                      <span>Enter copy module</span>
+                      <input
+                        id="copy-module-count"
+                        type="number"
+                        inputMode="numeric"
+                        min={1}
+                        step={1}
+                        value={copyModuleCount}
+                        onChange={(event) => {
+                          const raw = event.target.value;
+                          if (raw === '' || /^\d+$/.test(raw)) {
+                            setCopyModuleCount(raw);
+                          }
+                        }}
+                        disabled={loading || !copyEachModule}
+                      />
+                    </label>
                     <div className="bubble-actions">
                       <button
                         className="btn primary"
                         type="button"
-                        disabled={loading || moduleSelection.length === 0}
+                        disabled={
+                          loading ||
+                          moduleSelection.length === 0 ||
+                          (copyEachModule && !/^[1-9]\d*$/.test(copyModuleCount))
+                        }
                         onClick={confirmModuleSelection}
                       >
                         Confirm selection
@@ -735,7 +889,9 @@ export default function App() {
                     </tr>
                   </thead>
                   <tbody>
-                    {displaySchedule.seats.map((row, rowIndex) => (
+                    {orderedScheduleRows.map((rowIndex) => {
+                      const row = displaySchedule.seats[rowIndex] ?? [];
+                      return (
                       <Fragment key={rowIndex}>
                         <tr className="student-row student-row-primary">
                           <th className="module-col" rowSpan={2}>
@@ -757,7 +913,7 @@ export default function App() {
                           })}
                         </tr>
                       </Fragment>
-                    ))}
+                    );})}
                   </tbody>
                 </table>
               </div>

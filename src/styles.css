@@ -84,6 +84,11 @@ body {
   max-width: 100%;
 }
 
+.chat-thread .msg-row {
+  scroll-margin-top: 12px;
+  scroll-margin-bottom: 8px;
+}
+
 .msg-row-user {
   align-items: flex-end;
 }
@@ -332,6 +337,28 @@ body {
 
 .copy-module-option input {
   margin-top: 2px;
+}
+
+.copy-module-count {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin-top: 10px;
+  color: #3d4a63;
+  font-size: 0.88rem;
+}
+
+.copy-module-count input {
+  width: 110px;
+  padding: 8px 10px;
+  border-radius: 8px;
+  border: 1px solid #d0d8ea;
+  background: #fff;
+}
+
+.copy-module-count input:disabled {
+  background: #f1f4fb;
+  color: #7d889f;
 }
 
 .inline-pick-number {
