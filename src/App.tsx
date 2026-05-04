@@ -619,7 +619,6 @@ export default function App() {
 
   const rotationCols = displaySchedule ? scheduleRotationColumnCount(displaySchedule) : 0;
   const orderedScheduleRows = displaySchedule ? scheduleRowDisplayOrder(displaySchedule) : [];
-  const scheduleWarnings = displaySchedule?.warnings ?? [];
 
   return (
     <main className="page">
@@ -871,13 +870,6 @@ export default function App() {
           <div ref={schedulePanelRef} className="step-panels schedule-below-chat">
             <section className="step-card">
               <h2 className="step-title">Generated schedule</h2>
-              {scheduleWarnings.length > 0 && (
-                <div className="warning">
-                  {scheduleWarnings.map((warning, index) => (
-                    <p key={index}>{warning}</p>
-                  ))}
-                </div>
-              )}
               <div className="schedule-table-wrap">
                 <table className="schedule-table">
                   <thead>
