@@ -69,6 +69,22 @@ function isRotationalIntent(message: string): boolean {
   return keywords.some((keyword) => value.includes(keyword));
 }
 
+/** Detect when user wants to start a brand new schedule after one is already generated. */
+function isCreateNewScheduleIntent(message: string): boolean {
+  const value = message.toLowerCase().trim();
+  if (!value) return false;
+  const hasScheduleWord = /\b(schedule|rotational|rotation)\b/.test(value);
+  const hasFreshness = /\b(new|another|next|fresh|one\s+more|additional|again)\b/.test(value);
+  const explicitCreate =
+    /^\s*(create|generate|make|build|start|do)\b[^\n]*\b(another|new|fresh|next|additional|one\s+more|again)\b/.test(
+      value,
+    );
+  if (explicitCreate) {
+    return true;
+  }
+  return hasScheduleWord && hasFreshness;
+}
+
 /** Extract first 24-char Mongo ObjectId from a free-text message. */
 function extractClassIdFromMessage(message: string): string | null {
   const match = message.match(/\b[a-fA-F0-9]{24}\b/);
@@ -335,8 +351,60 @@ function catalogIdFromExpandedModuleRowId(id: string): string {
   return id.replace(/::__copy_\d+(?:_\d+)?$/i, '');
 }
 
+function ScheduleGridTable({ schedule }: { schedule: NonNullable<ApiResponse['schedule']> }) {
+  const rotationCols = scheduleRotationColumnCount(schedule);
+  const orderedRows = scheduleRowDisplayOrder(schedule);
+  return (
+    <div className="schedule-table-wrap">
+      <table className="schedule-table">
+        <thead>
+          <tr>
+            <th>Module</th>
+            {Array.from({ length: rotationCols }, (_, colIndex) => (
+              <th key={colIndex}>Rotation {colIndex + 1}</th>
+            ))}
+          </tr>
+        </thead>
+        <tbody>
+          {orderedRows.map((rowIndex) => {
+            const row = schedule.seats[rowIndex] ?? [];
+            return (
+              <Fragment key={rowIndex}>
+                <tr className="student-row student-row-primary">
+                  <th className="module-col" rowSpan={2}>
+                    {schedule.rowData?.[rowIndex]?.moduleName ?? `Module ${rowIndex + 1}`}
+                  </th>
+                  {Array.from({ length: rotationCols }, (_, colIndex) => {
+                    const cell = row[colIndex];
+                    return <td key={`p-${rowIndex}-${colIndex}`}>{getSeatSlot(cell, 0)}</td>;
+                  })}
+                </tr>
+                <tr className="student-row student-row-secondary">
+                  {Array.from({ length: rotationCols }, (_, colIndex) => {
+                    const cell = row[colIndex];
+                    return <td key={`s-${rowIndex}-${colIndex}`}>{getSeatSlot(cell, 1)}</td>;
+                  })}
+                </tr>
+              </Fragment>
+            );
+          })}
+        </tbody>
+      </table>
+    </div>
+  );
+}
+
+type CompletedScheduleEntry = {
+  id: string;
+  classId: string;
+  schedule: NonNullable<ApiResponse['schedule']>;
+  generatedAt: number;
+};
+
 export default function App() {
   const [sessionId, setSessionId] = useState('');
+  const [currentClassId, setCurrentClassId] = useState('');
+  const [completedSchedules, setCompletedSchedules] = useState<CompletedScheduleEntry[]>([]);
   const [chatInput, setChatInput] = useState('');
   const [chatMode, setChatMode] = useState<ChatMode>('awaiting_intent');
   const [seedScheduleIntent, setSeedScheduleIntent] = useState('');
@@ -517,6 +585,7 @@ export default function App() {
       }
       setResponse(data);
       setSessionId(data.sessionId);
+      setCurrentClassId(classId);
       setChatMode('active');
       setPersistedSchedule(mergePersistedSchedule(data, null));
       setStudentSelection([]);
@@ -566,6 +635,43 @@ export default function App() {
     }
   }
 
+  function archiveCurrentScheduleAndResetForNewFlow(triggerMessage: string): boolean {
+    const schedule = displaySchedule;
+    if (schedule) {
+      setCompletedSchedules((prev) => [
+        ...prev,
+        {
+          id: `s-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
+          classId: currentClassId,
+          schedule,
+          generatedAt: Date.now(),
+        },
+      ]);
+    }
+    setSessionId('');
+    setCurrentClassId('');
+    setResponse(null);
+    setPersistedSchedule(null);
+    setStudentSelection([]);
+    setModuleSelection([]);
+    setScheduleTypeSelection('');
+    setCopyEachModule(false);
+    setCopyModuleCount('1');
+    setError('');
+    setChatMode('awaiting_class_id');
+    setSeedScheduleIntent(triggerMessage);
+    didIntroScrollToScheduleRef.current = false;
+    completedScheduleEverRef.current = false;
+    moduleCapacityScrollDoneForMessageIdRef.current = null;
+    appendMessages([
+      {
+        role: 'assistant',
+        text: "Sure — let's create another rotational schedule. Please provide the new class ID.",
+      },
+    ]);
+    return true;
+  }
+
   async function onSubmitChat(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
     const message = chatInput.trim();
@@ -574,6 +680,21 @@ export default function App() {
     }
     setChatInput('');
     appendMessages([{ role: 'user', text: message }]);
+
+    /**
+     * After a schedule is generated, accept "create new schedule" / "another schedule" /
+     * "new rotational schedule" as a shortcut that resets the session and asks for a fresh class ID.
+     * Inline class IDs in the same message are honored so the user can skip the prompt.
+     */
+    if (sessionId && response?.step === 'completed' && isCreateNewScheduleIntent(message)) {
+      const inlineClassId = extractClassIdFromMessage(message);
+      const handled = archiveCurrentScheduleAndResetForNewFlow(message);
+      if (handled && inlineClassId) {
+        setSeedScheduleIntent('');
+        await startSession(inlineClassId, message);
+      }
+      return;
+    }
 
     if (!sessionId) {
       if (chatMode === 'awaiting_intent') {
@@ -688,9 +809,6 @@ export default function App() {
     }
     return <p className="bubble-text">{message.text}</p>;
   }
-
-  const rotationCols = displaySchedule ? scheduleRotationColumnCount(displaySchedule) : 0;
-  const orderedScheduleRows = displaySchedule ? scheduleRowDisplayOrder(displaySchedule) : [];
 
   return (
     <main className="page">
@@ -940,49 +1058,27 @@ export default function App() {
 
         {error && <p className="error">{error}</p>}
 
+        {completedSchedules.map((entry, index) => (
+          <div key={entry.id} className="step-panels schedule-below-chat">
+            <section className="step-card">
+              <h2 className="step-title">
+                Schedule {index + 1}
+                {entry.classId ? ` — Class ${entry.classId}` : ''}
+              </h2>
+              <ScheduleGridTable schedule={entry.schedule} />
+            </section>
+          </div>
+        ))}
+
         {displaySchedule && (
           <div ref={schedulePanelRef} className="step-panels schedule-below-chat">
             <section className="step-card">
-              <h2 className="step-title">Generated schedule</h2>
-              <div className="schedule-table-wrap">
-                <table className="schedule-table">
-                  <thead>
-                    <tr>
-                      <th>Module</th>
-                      {Array.from({ length: rotationCols }, (_, colIndex) => (
-                        <th key={colIndex}>Rotation {colIndex + 1}</th>
-                      ))}
-                    </tr>
-                  </thead>
-                  <tbody>
-                    {orderedScheduleRows.map((rowIndex) => {
-                      const row = displaySchedule.seats[rowIndex] ?? [];
-                      return (
-                      <Fragment key={rowIndex}>
-                        <tr className="student-row student-row-primary">
-                          <th className="module-col" rowSpan={2}>
-                            {displaySchedule.rowData?.[rowIndex]?.moduleName ?? `Module ${rowIndex + 1}`}
-                          </th>
-                          {Array.from({ length: rotationCols }, (_, colIndex) => {
-                            const cell = row[colIndex];
-                            return (
-                              <td key={`p-${rowIndex}-${colIndex}`}>{getSeatSlot(cell, 0)}</td>
-                            );
-                          })}
-                        </tr>
-                        <tr className="student-row student-row-secondary">
-                          {Array.from({ length: rotationCols }, (_, colIndex) => {
-                            const cell = row[colIndex];
-                            return (
-                              <td key={`s-${rowIndex}-${colIndex}`}>{getSeatSlot(cell, 1)}</td>
-                            );
-                          })}
-                        </tr>
-                      </Fragment>
-                    );})}
-                  </tbody>
-                </table>
-              </div>
+              <h2 className="step-title">
+                {completedSchedules.length > 0
+                  ? `Schedule ${completedSchedules.length + 1}${currentClassId ? ` — Class ${currentClassId}` : ''}`
+                  : 'Generated schedule'}
+              </h2>
+              <ScheduleGridTable schedule={displaySchedule} />
             </section>
           </div>
         )}
