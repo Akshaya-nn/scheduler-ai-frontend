@@ -718,7 +718,19 @@ export default function App() {
         appendMessages([{ role: 'assistant', text: 'Please provide the class ID.' }]);
         return;
       }
-      await startSession(message, seedScheduleIntent);
+      const inlineClassId = extractClassIdFromMessage(message);
+      if (!inlineClassId) {
+        appendMessages([
+          {
+            role: 'assistant',
+            text: 'Please provide a valid 24-character class ID.',
+          },
+        ]);
+        return;
+      }
+      const remainingIntent = message.replace(inlineClassId, ' ').replace(/\s+/g, ' ').trim();
+      const composedIntent = [seedScheduleIntent.trim(), remainingIntent].filter((part) => part.length > 0).join('. ');
+      await startSession(inlineClassId, composedIntent || undefined);
       setSeedScheduleIntent('');
       return;
     }
