@@ -590,7 +590,11 @@ body { margin: 0; -webkit-font-smoothing: antialiased; }
   gap: 14px;
 }
 
-.schedule-below-chat { margin-top: 18px; }
+.schedule-below-chat {
+  margin-top: 18px;
+  /* Gives `scrollIntoView({ block: 'start' })` breathing room below any sticky UI */
+  scroll-margin-top: 1.25rem;
+}
 
 .step-card {
   position: relative;

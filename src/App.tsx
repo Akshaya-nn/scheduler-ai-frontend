@@ -209,6 +209,9 @@ function assistantChunksAfterResponse(data: ApiResponse): string[] {
   if (raw.includes('| --- |')) {
     return [raw];
   }
+  if (/^Here's the plan based on your selection:/i.test(raw)) {
+    return [raw];
+  }
   const parts = raw
     .split(/\n{2,}/)
     .map((line) => line.trim())
@@ -315,16 +318,21 @@ function pickScheduleFromPayload(data: ApiResponse): ApiResponse['schedule'] | n
   return s as ApiResponse['schedule'];
 }
 
-/** Prefer fresh grid from the response; keep last grid only while step is still `completed` (API may omit schedule). Clear when the server invalidates inputs (mid-flow). */
+/** Prefer fresh grid from the response; keep last grid when API omits it (e.g. reopening module picker after `completed`). */
 function mergePersistedSchedule(data: ApiResponse, previous: ApiResponse['schedule'] | null): ApiResponse['schedule'] | null {
   const picked = pickScheduleFromPayload(data);
   if (picked !== null) {
     return picked;
   }
-  if (data.step === 'completed') {
+  if (data.step === 'completed' || data.step === 'awaiting_modules' || data.step === 'awaiting_students') {
     return previous;
   }
   return null;
+}
+
+/** Copy rows expand `selectedModules` with synthetic suffixes; checklist rows use catalog ids. */
+function catalogIdFromExpandedModuleRowId(id: string): string {
+  return id.replace(/::__copy_\d+(?:_\d+)?$/i, '');
 }
 
 export default function App() {
@@ -352,12 +360,21 @@ export default function App() {
 
   const threadEndRef = useRef<HTMLDivElement>(null);
   const schedulePanelRef = useRef<HTMLDivElement>(null);
+  /** True after we auto-scrolled the page to "Generated schedule" once this session (not on every grid refresh). */
+  const didIntroScrollToScheduleRef = useRef(false);
+  /** True once the user has reached `completed` with a grid — used to skip chat auto-scroll during module-edit interrupts. */
+  const completedScheduleEverRef = useRef(false);
   /** Avoid double `scrollIntoView` in React Strict Mode for the same bubble. */
   const moduleCapacityScrollDoneForMessageIdRef = useRef<string | null>(null);
 
   const appendMessages = useCallback((entries: Omit<ChatMessage, 'id'>[]) => {
     setChatMessages((prev) => [...prev, ...entries.map((e) => ({ ...e, id: nextMessageId() }))]);
   }, []);
+
+  useEffect(() => {
+    didIntroScrollToScheduleRef.current = false;
+    completedScheduleEverRef.current = false;
+  }, [sessionId]);
 
   useEffect(() => {
     const last = chatMessages[chatMessages.length - 1];
@@ -381,15 +398,28 @@ export default function App() {
       return;
     }
 
+    /**
+     * After a schedule exists, reopening modules (`awaiting_modules`) appends assistant text + inline picker.
+     * Scrolling `threadEndRef` into view walks scroll parents and often yanks the **page** down to the
+     * schedule below the composer. Skip that auto-scroll during this interrupt; user stays on the chat/picker.
+     */
+    if (
+      (response?.step === 'awaiting_modules' || response?.step === 'awaiting_students') &&
+      completedScheduleEverRef.current
+    ) {
+      return;
+    }
+
     threadEndRef.current?.scrollIntoView({ behavior: 'smooth' });
   }, [chatMessages, loading, response?.step, response?.assistantMessage]);
 
-  const selectedModuleIdsSig = (response?.selectedModules ?? []).map((m) => m.id).join('|');
+  const selectedModuleIdsSig = [...new Set((response?.selectedModules ?? []).map((m) => catalogIdFromExpandedModuleRowId(m.id)))].join('|');
   useEffect(() => {
     if (response?.step !== 'awaiting_modules') {
       return;
     }
-    setModuleSelection((response.selectedModules ?? []).map((m) => m.id));
+    const ids = [...new Set((response.selectedModules ?? []).map((m) => catalogIdFromExpandedModuleRowId(m.id)))];
+    setModuleSelection(ids);
   }, [response?.sessionId, response?.step, selectedModuleIdsSig]);
 
   const selectedStudentIdsSig = (response?.selectedStudents ?? []).map((s) => s.id).join('|');
@@ -408,15 +438,57 @@ export default function App() {
   }, [response?.sessionId, response?.step, scheduleTypesSig, hasContentList]);
 
   const normalizedSchedule = response ? pickScheduleFromPayload(response) : null;
-  /** Keep showing the last grid when reopening module pick after `completed` (API still sends the schedule). */
+  /** Keep showing the last grid when reopening module/student pick after `completed` (API may omit `schedule` on interrupt steps). */
   const displaySchedule =
     normalizedSchedule ??
-    (response?.step === 'completed' || response?.step === 'awaiting_modules' ? persistedSchedule : null);
+    (response?.step === 'completed' ||
+    response?.step === 'awaiting_modules' ||
+    response?.step === 'awaiting_students'
+      ? persistedSchedule
+      : null);
+
+  /**
+   * Remember that the user has seen a completed grid (for interrupt scroll behavior).
+   */
   useEffect(() => {
-    if (displaySchedule) {
-      schedulePanelRef.current?.scrollIntoView({ behavior: 'smooth', block: 'end' });
+    if (!response || response.sessionId !== sessionId) {
+      return;
     }
-  }, [displaySchedule]);
+    if (response.step !== 'completed') {
+      return;
+    }
+    const grid = normalizedSchedule ?? persistedSchedule;
+    if (grid) {
+      completedScheduleEverRef.current = true;
+    }
+  }, [response, sessionId, normalizedSchedule, persistedSchedule]);
+
+  /**
+   * Scroll the viewport to the **Generated schedule** heading only the first time
+   * a grid appears in the `completed` step. Later regenerations (module edits, etc.)
+   * keep the user’s scroll position so chat stays in view.
+   */
+  useEffect(() => {
+    if (!response || response.sessionId !== sessionId) {
+      return;
+    }
+    if (response.step !== 'completed') {
+      return;
+    }
+    const grid = normalizedSchedule ?? persistedSchedule;
+    if (!grid) {
+      return;
+    }
+    if (didIntroScrollToScheduleRef.current) {
+      return;
+    }
+    didIntroScrollToScheduleRef.current = true;
+    requestAnimationFrame(() => {
+      requestAnimationFrame(() => {
+        schedulePanelRef.current?.scrollIntoView({ behavior: 'smooth', block: 'start' });
+      });
+    });
+  }, [response, sessionId, normalizedSchedule, persistedSchedule]);
 
   const selectedStudentNamesSig = (response?.selectedStudents ?? []).map((s) => s.fullName).join('|');
   useEffect(() => {
@@ -446,7 +518,7 @@ export default function App() {
       setResponse(data);
       setSessionId(data.sessionId);
       setChatMode('active');
-      setPersistedSchedule((prev) => mergePersistedSchedule(data, prev));
+      setPersistedSchedule(mergePersistedSchedule(data, null));
       setStudentSelection([]);
       setModuleSelection([]);
       setCopyEachModule(false);
@@ -760,7 +832,9 @@ export default function App() {
                     </div>
                     <ul className="inline-pick-list inline-pick-list-numbered" aria-label="Items — tick to include">
                       {response.modules.map((moduleItem, index) => {
-                        const onCurrentSchedule = (response.selectedModules ?? []).some((m) => m.id === moduleItem.id);
+                        const onCurrentSchedule = (response.selectedModules ?? []).some(
+                          (m) => catalogIdFromExpandedModuleRowId(m.id) === moduleItem.id,
+                        );
                         return (
                           <li key={moduleItem.id}>
                             <label className="inline-pick-row inline-pick-row-numbered inline-pick-row-modules">
