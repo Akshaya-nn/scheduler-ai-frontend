@@ -308,6 +308,15 @@ function scheduleRowDisplayOrder(schedule: NonNullable<ApiResponse['schedule']>)
   return out;
 }
 
+function scheduleFingerprint(schedule: NonNullable<ApiResponse['schedule']>): string {
+  return JSON.stringify({
+    seats: schedule.seats ?? [],
+    rowData: schedule.rowData ?? [],
+    rowCount: schedule.rowCount ?? 0,
+    colCount: schedule.colCount ?? 0,
+  });
+}
+
 /** Nest interceptor may add statusCode/success/message; some proxies nest the body under `data`. */
 function unwrapAiRotationalPayload(raw: Record<string, unknown>): Record<string, unknown> {
   const nested = raw.data;
@@ -426,10 +435,10 @@ export default function App() {
     },
   ]);
 
-  const threadEndRef = useRef<HTMLDivElement>(null);
+  const chatThreadRef = useRef<HTMLDivElement>(null);
   const schedulePanelRef = useRef<HTMLDivElement>(null);
-  /** True after we auto-scrolled the page to "Generated schedule" once this session (not on every grid refresh). */
-  const didIntroScrollToScheduleRef = useRef(false);
+  /** Track last completed schedule snapshot that triggered auto-scroll to the grid. */
+  const lastScrolledScheduleFingerprintRef = useRef<string | null>(null);
   /** True once the user has reached `completed` with a grid — used to skip chat auto-scroll during module-edit interrupts. */
   const completedScheduleEverRef = useRef(false);
   /** Avoid double `scrollIntoView` in React Strict Mode for the same bubble. */
@@ -440,7 +449,7 @@ export default function App() {
   }, []);
 
   useEffect(() => {
-    didIntroScrollToScheduleRef.current = false;
+    lastScrolledScheduleFingerprintRef.current = null;
     completedScheduleEverRef.current = false;
   }, [sessionId]);
 
@@ -478,7 +487,14 @@ export default function App() {
       return;
     }
 
-    threadEndRef.current?.scrollIntoView({ behavior: 'smooth' });
+    const thread = chatThreadRef.current;
+    if (!thread) {
+      return;
+    }
+    thread.scrollTo({
+      top: thread.scrollHeight,
+      behavior: 'smooth',
+    });
   }, [chatMessages, loading, response?.step, response?.assistantMessage]);
 
   const selectedModuleIdsSig = [...new Set((response?.selectedModules ?? []).map((m) => catalogIdFromExpandedModuleRowId(m.id)))].join('|');
@@ -532,9 +548,8 @@ export default function App() {
   }, [response, sessionId, normalizedSchedule, persistedSchedule]);
 
   /**
-   * Scroll the viewport to the **Generated schedule** heading only the first time
-   * a grid appears in the `completed` step. Later regenerations (module edits, etc.)
-   * keep the user’s scroll position so chat stays in view.
+   * Scroll to the generated schedule when a newly completed/updated grid is received.
+   * Plain chat messages should stay within the chat thread without yanking the page.
    */
   useEffect(() => {
     if (!response || response.sessionId !== sessionId) {
@@ -543,14 +558,15 @@ export default function App() {
     if (response.step !== 'completed') {
       return;
     }
-    const grid = normalizedSchedule ?? persistedSchedule;
+    const grid = normalizedSchedule;
     if (!grid) {
       return;
     }
-    if (didIntroScrollToScheduleRef.current) {
+    const fingerprint = scheduleFingerprint(grid);
+    if (lastScrolledScheduleFingerprintRef.current === fingerprint) {
       return;
     }
-    didIntroScrollToScheduleRef.current = true;
+    lastScrolledScheduleFingerprintRef.current = fingerprint;
     requestAnimationFrame(() => {
       requestAnimationFrame(() => {
         schedulePanelRef.current?.scrollIntoView({ behavior: 'smooth', block: 'start' });
@@ -660,7 +676,7 @@ export default function App() {
     setError('');
     setChatMode('awaiting_class_id');
     setSeedScheduleIntent(triggerMessage);
-    didIntroScrollToScheduleRef.current = false;
+    lastScrolledScheduleFingerprintRef.current = null;
     completedScheduleEverRef.current = false;
     moduleCapacityScrollDoneForMessageIdRef.current = null;
     appendMessages([
@@ -827,7 +843,7 @@ export default function App() {
       <section className="card">
         <h1>AI Rotational Scheduler</h1>
 
-        <div className="chat-thread" role="log" aria-live="polite">
+        <div ref={chatThreadRef} className="chat-thread" role="log" aria-live="polite">
           {chatMessages.map((message) => (
             <div
               key={message.id}
@@ -1047,7 +1063,6 @@ export default function App() {
               </div>
             </div>
           )}
-          <div ref={threadEndRef} />
         </div>
 
         <form className="composer" onSubmit={onSubmitChat}>
