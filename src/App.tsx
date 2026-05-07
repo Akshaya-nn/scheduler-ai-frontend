@@ -8,6 +8,15 @@ function toggleId(id: string, list: string[], setter: (next: string[]) => void) 
   setter([...list, id]);
 }
 
+function toggleAllIds(ids: string[], list: string[], setter: (next: string[]) => void) {
+  if (ids.length === 0) {
+    setter([]);
+    return;
+  }
+  const allSelected = ids.every((id) => list.includes(id));
+  setter(allSelected ? [] : [...ids]);
+}
+
 type Student = { id: string; fullName: string };
 type ModuleItem = { id: string; name: string };
 type ScheduleTypeItem = { id: string; name: string; type: string };
@@ -871,6 +880,36 @@ export default function App() {
                   <span className="inline-pick-head-name">Student</span>
                   <span className="inline-pick-head-selected">Selected</span>
                 </div>
+                <label className="inline-pick-row inline-pick-row-numbered inline-pick-row-modules">
+                  <span className="inline-pick-number" aria-hidden>
+                    0.
+                  </span>
+                  <input
+                    type="checkbox"
+                    checked={
+                      response.students.length > 0 &&
+                      response.students.every((student) => studentSelection.includes(student.id))
+                    }
+                    onChange={() =>
+                      toggleAllIds(
+                        response.students.map((student) => student.id),
+                        studentSelection,
+                        setStudentSelection,
+                      )
+                    }
+                  />
+                  <span className="inline-pick-name">Select all students</span>
+                  <span className="inline-pick-selected-cell">
+                    {response.students.length > 0 &&
+                    response.students.every((student) => studentSelection.includes(student.id)) ? (
+                      <span className="inline-pick-selected-yes" title="All students selected">
+                        Yes
+                      </span>
+                    ) : (
+                      <span className="inline-pick-selected-dash">—</span>
+                    )}
+                  </span>
+                </label>
                 <ul className="inline-pick-list inline-pick-list-numbered" aria-label="Students — tick to include">
                   {response.students.map((student, index) => {
                     const selected = studentSelection.includes(student.id);
@@ -976,6 +1015,34 @@ export default function App() {
                       </span>
                       <span className="inline-pick-head-selected">Selected</span>
                     </div>
+                    <label className="inline-pick-row inline-pick-row-numbered inline-pick-row-modules">
+                      <span className="inline-pick-number" aria-hidden>
+                        0.
+                      </span>
+                      <input
+                        type="checkbox"
+                        checked={response.modules.length > 0 && response.modules.every((m) => moduleSelection.includes(m.id))}
+                        onChange={() =>
+                          toggleAllIds(
+                            response.modules.map((m) => m.id),
+                            moduleSelection,
+                            setModuleSelection,
+                          )
+                        }
+                      />
+                      <span className="inline-pick-name">
+                        Select all {response.selectedScheduleType?.type === 'expedition' ? 'expeditions' : 'modules'}
+                      </span>
+                      <span className="inline-pick-selected-cell">
+                        {response.modules.length > 0 && response.modules.every((m) => moduleSelection.includes(m.id)) ? (
+                          <span className="inline-pick-selected-yes" title="All items selected">
+                            Yes
+                          </span>
+                        ) : (
+                          <span className="inline-pick-selected-dash">—</span>
+                        )}
+                      </span>
+                    </label>
                     <ul className="inline-pick-list inline-pick-list-numbered" aria-label="Items — tick to include">
                       {response.modules.map((moduleItem, index) => {
                         const onCurrentSchedule = (response.selectedModules ?? []).some(
