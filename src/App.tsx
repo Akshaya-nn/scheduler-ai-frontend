@@ -28,6 +28,7 @@ type ApiResponse = {
     | 'awaiting_students'
     | 'awaiting_modules'
     | 'awaiting_rotation_count'
+    | 'awaiting_rotation_range'
     | 'awaiting_rotation_capacity_decision'
     | 'awaiting_pairing'
     | 'ready_to_generate'
@@ -225,6 +226,9 @@ function assistantChunksAfterResponse(data: ApiResponse): string[] {
     if (isAwaitingModulesTimelineAssistantSurface(rawAwaitingModules)) {
       return [stripNumberedListLines(rawAwaitingModules)];
     }
+    return [];
+  }
+  if (data.step === 'awaiting_rotation_range') {
     return [];
   }
   const raw = (data.assistantMessage ?? '').trim();
@@ -435,6 +439,8 @@ export default function App() {
   const [scheduleTypeSelection, setScheduleTypeSelection] = useState<string>('');
   const [copyEachModule, setCopyEachModule] = useState(false);
   const [copyModuleCount, setCopyModuleCount] = useState('1');
+  const [startRotationSelection, setStartRotationSelection] = useState('1');
+  const [endRotationSelection, setEndRotationSelection] = useState('2');
   const [error, setError] = useState('');
   const [chatMessages, setChatMessages] = useState<ChatMessage[]>([
     {
@@ -530,13 +536,23 @@ export default function App() {
     setScheduleTypeSelection('');
   }, [response?.sessionId, response?.step, scheduleTypesSig, hasContentList]);
 
+  useEffect(() => {
+    if (!response || response.step !== 'awaiting_rotation_range') {
+      return;
+    }
+    const totalRotations = Math.max(1, response.schedule?.colCount ?? response.config?.endRotation ?? 1);
+    setStartRotationSelection('1');
+    setEndRotationSelection(String(Math.min(totalRotations, 2)));
+  }, [response?.sessionId, response?.step, response?.schedule?.colCount, response?.config?.endRotation]);
+
   const normalizedSchedule = response ? pickScheduleFromPayload(response) : null;
   /** Keep showing the last grid when reopening module/student pick after `completed` (API may omit `schedule` on interrupt steps). */
   const displaySchedule =
     normalizedSchedule ??
     (response?.step === 'completed' ||
     response?.step === 'awaiting_modules' ||
-    response?.step === 'awaiting_students'
+    response?.step === 'awaiting_students' ||
+    response?.step === 'awaiting_rotation_range'
       ? persistedSchedule
       : null);
 
@@ -823,6 +839,26 @@ export default function App() {
     await sendMessage(
       `I confirm these modules for the rotation: ${names.join(', ')}. Call select_modules with moduleIds exactly ${idsJson}.${copyPart} Then continue the workflow.`,
     );
+  }
+
+  async function confirmRotationRangeSelection() {
+    if (!response || response.step !== 'awaiting_rotation_range') return;
+    if (loading) return;
+    const totalRotations = Math.max(1, response.schedule?.colCount ?? response.config?.endRotation ?? 1);
+    const start = Number.parseInt(startRotationSelection, 10);
+    const end = Number.parseInt(endRotationSelection, 10);
+    if (!Number.isInteger(start) || !Number.isInteger(end)) return;
+    if (start < 1 || start >= totalRotations) return;
+    if (end <= start || end > totalRotations) return;
+
+    appendMessages([
+      {
+        role: 'user',
+        heading: 'Selected rotation range',
+        items: [`Start rotation: ${start}`, `End rotation: ${end}`],
+      },
+    ]);
+    await sendMessage(`start rotation exactly ${start} end rotation exactly ${end}`);
   }
 
   function renderMessageBody(message: ChatMessage) {
@@ -1117,6 +1153,79 @@ export default function App() {
                     </div>
                   </>
                 )}
+              </div>
+            </div>
+          )}
+          {response?.step === 'awaiting_rotation_range' && (
+            <div className="msg-row msg-row-assistant">
+              <div className="msg-meta">Assistant</div>
+              <div className="bubble bubble-assistant bubble-embed bubble-embed-unified">
+                {(response.assistantMessage ?? '')
+                  .split(/\n+/)
+                  .filter((line) => line.trim().length > 0)
+                  .map((line, i) => (
+                    <p key={i} className="bubble-text bubble-text-tight">
+                      {line}
+                    </p>
+                  ))}
+                <label className="copy-module-count" htmlFor="start-rotation-range">
+                  <span>Start rotation</span>
+                  <input
+                    id="start-rotation-range"
+                    type="number"
+                    inputMode="numeric"
+                    min={1}
+                    step={1}
+                    value={startRotationSelection}
+                    onChange={(event) => {
+                      const raw = event.target.value;
+                      if (raw === '' || /^\d+$/.test(raw)) {
+                        setStartRotationSelection(raw);
+                      }
+                    }}
+                    disabled={loading}
+                  />
+                </label>
+                <label className="copy-module-count" htmlFor="end-rotation-range">
+                  <span>End rotation</span>
+                  <input
+                    id="end-rotation-range"
+                    type="number"
+                    inputMode="numeric"
+                    min={1}
+                    step={1}
+                    value={endRotationSelection}
+                    onChange={(event) => {
+                      const raw = event.target.value;
+                      if (raw === '' || /^\d+$/.test(raw)) {
+                        setEndRotationSelection(raw);
+                      }
+                    }}
+                    disabled={loading}
+                  />
+                </label>
+                <div className="bubble-actions">
+                  <button
+                    className="btn primary"
+                    type="button"
+                    disabled={
+                      loading ||
+                      !response ||
+                      (() => {
+                        const total = Math.max(1, response.schedule?.colCount ?? response.config?.endRotation ?? 1);
+                        const s = Number.parseInt(startRotationSelection, 10);
+                        const e = Number.parseInt(endRotationSelection, 10);
+                        if (!Number.isInteger(s) || !Number.isInteger(e)) return true;
+                        if (s < 1 || s >= total) return true;
+                        if (e <= s || e > total) return true;
+                        return false;
+                      })()
+                    }
+                    onClick={confirmRotationRangeSelection}
+                  >
+                    Confirm rotation range
+                  </button>
+                </div>
               </div>
             </div>
           )}
