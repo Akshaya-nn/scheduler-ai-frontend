@@ -22,19 +22,25 @@ type ModuleItem = { id: string; name: string };
 type ScheduleTypeItem = { id: string; name: string; type: string };
 type SeatCell = { 0: { id: string; fullName: string }; 1: { id: string; fullName: string } };
 
+/** Public API `step` — what the client should show next (matches server `SelectionStep`). */
+type ResponseStep =
+  | 'schedule_types'
+  | 'modules'
+  | 'students'
+  | 'rotation_range'
+  | 'rotation_count'
+  | 'plan'
+  | 'rotation_capacity'
+  | 'pairing'
+  | 'schedule'
+  | 'completed'
+  | 'generic';
+
 type ApiResponse = {
   statusCode?: number;
   success?: boolean;
   sessionId: string;
-  step:
-    | 'awaiting_students'
-    | 'awaiting_modules'
-    | 'awaiting_rotation_count'
-    | 'awaiting_rotation_range'
-    | 'awaiting_rotation_capacity_decision'
-    | 'awaiting_pairing'
-    | 'ready_to_generate'
-    | 'completed';
+  step: ResponseStep;
   assistantMessage: string;
   rotationRangeMax?: number;
   students: Student[];
@@ -62,7 +68,7 @@ type ApiResponse = {
 function mergePartialAiResponse(prev: ApiResponse | null, incoming: Record<string, unknown>): ApiResponse {
   const i = incoming as Partial<ApiResponse>;
   const students = i.students !== undefined ? i.students : (prev?.students ?? []);
-  const step = (i.step ?? prev?.step ?? 'awaiting_modules') as ApiResponse['step'];
+  const step = (i.step ?? prev?.step ?? 'generic') as ApiResponse['step'];
   let modules = i.modules !== undefined ? i.modules : (prev?.modules ?? []);
   /**
    * Schedule-type-only turns omit `modules`; without this, merged state keeps the old catalog and
@@ -73,17 +79,11 @@ function mergePartialAiResponse(prev: ApiResponse | null, incoming: Record<strin
     i.scheduleTypes !== undefined &&
     Array.isArray(i.scheduleTypes) &&
     i.scheduleTypes.length > 0 &&
-    step === 'awaiting_modules'
+    step === 'schedule_types'
   ) {
     modules = [];
   }
-  const mergedScheduleTypesForPicker =
-    i.scheduleTypes !== undefined ? i.scheduleTypes : prev?.scheduleTypes;
-  const scheduleTypeListActive =
-    step === 'awaiting_modules' &&
-    Array.isArray(mergedScheduleTypesForPicker) &&
-    mergedScheduleTypesForPicker.length > 0 &&
-    modules.length === 0;
+  const scheduleTypeListActive = step === 'schedule_types';
   const selectedModules = i.selectedModules !== undefined
     ? i.selectedModules
     : scheduleTypeListActive
@@ -93,7 +93,7 @@ function mergePartialAiResponse(prev: ApiResponse | null, incoming: Record<strin
     statusCode: i.statusCode ?? prev?.statusCode,
     success: i.success ?? prev?.success,
     sessionId: (i.sessionId ?? prev?.sessionId ?? '') as string,
-    step: (i.step ?? prev?.step ?? 'awaiting_modules') as ApiResponse['step'],
+    step: (i.step ?? prev?.step ?? 'generic') as ApiResponse['step'],
     assistantMessage: (i.assistantMessage ?? prev?.assistantMessage ?? '') as string,
     rotationRangeMax: i.rotationRangeMax !== undefined ? i.rotationRangeMax : prev?.rotationRangeMax,
     students,
@@ -206,7 +206,7 @@ function isScheduleTypeRetryMessage(assistantMessage: string): boolean {
 }
 
 /**
- * When step is awaiting_modules, most assistant text is only shown inside the inline picker.
+ * When step is `modules` or `schedule_types`, most assistant text is only shown inside the inline picker.
  * Capacity / validation replies must also appear as timeline bubbles so the flow reads
  * user → assistant → user, not several user rows with no visible reply.
  */
@@ -299,18 +299,22 @@ function modulePickerIntroText(
 
 /** Split the model reply into chat bubbles; backend is the single source of truth (OpenAI + tools). */
 function assistantChunksAfterResponse(data: ApiResponse): string[] {
-  if (data.step === 'awaiting_students') {
+  if (data.step === 'students') {
     return [];
   }
-  if (data.step === 'awaiting_modules') {
+  if (data.step === 'modules' || data.step === 'schedule_types') {
     const rawAwaitingModules = (data.assistantMessage ?? '').trim();
     if (isAwaitingModulesTimelineAssistantSurface(rawAwaitingModules)) {
       return [stripNumberedListLines(rawAwaitingModules)];
     }
     return [];
   }
-  if (data.step === 'awaiting_rotation_range') {
+  if (data.step === 'rotation_range') {
     return [];
+  }
+  if (data.step === 'plan') {
+    const planText = (data.assistantMessage ?? '').trim();
+    return planText ? [planText] : ['…'];
   }
   const raw = (data.assistantMessage ?? '').trim();
   if (!raw) {
@@ -443,7 +447,7 @@ function mergePersistedSchedule(data: ApiResponse, previous: ApiResponse['schedu
   if (picked !== null) {
     return picked;
   }
-  if (data.step === 'completed' || data.step === 'awaiting_modules' || data.step === 'awaiting_students') {
+  if (data.step === 'completed' || data.step === 'modules' || data.step === 'schedule_types' || data.step === 'students') {
     return previous;
   }
   return null;
@@ -553,7 +557,7 @@ export default function App() {
     const lastId = last?.id ?? null;
 
     const moduleTimelineError =
-      response?.step === 'awaiting_modules' &&
+      response?.step === 'modules' &&
       isAwaitingModulesTimelineAssistantSurface((response.assistantMessage ?? '').trim());
 
     if (moduleTimelineError && last?.role === 'assistant' && lastId) {
@@ -571,12 +575,12 @@ export default function App() {
     }
 
     /**
-     * After a schedule exists, reopening modules (`awaiting_modules`) appends assistant text + inline picker.
+     * After a schedule exists, reopening modules (`modules` step) appends assistant text + inline picker.
      * Scrolling `threadEndRef` into view walks scroll parents and often yanks the **page** down to the
      * schedule below the composer. Skip that auto-scroll during this interrupt; user stays on the chat/picker.
      */
     if (
-      (response?.step === 'awaiting_modules' || response?.step === 'awaiting_students') &&
+      (response?.step === 'modules' || response?.step === 'students') &&
       completedScheduleEverRef.current
     ) {
       return;
@@ -594,7 +598,7 @@ export default function App() {
 
   const selectedModuleIdsSig = [...new Set((response?.selectedModules ?? []).map((m) => catalogIdFromExpandedModuleRowId(m.id)))].join('|');
   useEffect(() => {
-    if (response?.step !== 'awaiting_modules') {
+    if (response?.step !== 'modules') {
       return;
     }
     const ids = [...new Set((response.selectedModules ?? []).map((m) => catalogIdFromExpandedModuleRowId(m.id)))];
@@ -603,7 +607,7 @@ export default function App() {
 
   const selectedStudentIdsSig = (response?.selectedStudents ?? []).map((s) => s.id).join('|');
   useEffect(() => {
-    if (response?.step !== 'awaiting_students') {
+    if (response?.step !== 'students') {
       return;
     }
     setStudentSelection((response.selectedStudents ?? []).map((s) => s.id));
@@ -617,7 +621,7 @@ export default function App() {
   }, [response?.sessionId, response?.step, scheduleTypesSig, hasContentList]);
 
   useEffect(() => {
-    if (!response || response.step !== 'awaiting_rotation_range') {
+    if (!response || response.step !== 'rotation_range') {
       return;
     }
     const totalRotations = Math.max(
@@ -639,9 +643,10 @@ export default function App() {
   const displaySchedule =
     normalizedSchedule ??
     (response?.step === 'completed' ||
-    response?.step === 'awaiting_modules' ||
-    response?.step === 'awaiting_students' ||
-    response?.step === 'awaiting_rotation_range'
+    response?.step === 'modules' ||
+    response?.step === 'schedule_types' ||
+    response?.step === 'students' ||
+    response?.step === 'rotation_range'
       ? persistedSchedule
       : null);
 
@@ -735,27 +740,16 @@ export default function App() {
     }
   }
 
-  type SessionMessagePayload = {
-    message?: string;
-    moduleIds?: string[];
-    copyEachSelectedModule?: boolean;
-    copyModuleCount?: number;
-  };
-
-  async function sendMessage(payload: string | SessionMessagePayload) {
+  async function sendMessage(message: string) {
     const activeSessionId = sessionId;
     if (!activeSessionId) return;
     setLoading(true);
     setError('');
     try {
-      const body: SessionMessagePayload & { sessionId: string } =
-        typeof payload === 'string'
-          ? { sessionId: activeSessionId, message: payload }
-          : { sessionId: activeSessionId, ...payload };
       const res = await fetch(`${apiBase}/ai-rotational/session/message`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(body),
+        body: JSON.stringify({ sessionId: activeSessionId, message }),
       });
       const raw = (await res.json()) as Record<string, unknown>;
       const unwrapped = unwrapAiRotationalPayload(raw) as Record<string, unknown>;
@@ -882,7 +876,7 @@ export default function App() {
   }
 
   async function confirmStudentSelection() {
-    if (!response || response.step !== 'awaiting_students') return;
+    if (!response || response.step !== 'students') return;
     if (loading) return;
     if (studentSelection.length === 0) return;
     const names = studentSelection
@@ -902,7 +896,7 @@ export default function App() {
   }
 
   async function confirmScheduleTypeSelection() {
-    if (!response || response.step !== 'awaiting_modules') return;
+    if (!response || response.step !== 'schedule_types') return;
     if (loading) return;
     const pickedId = scheduleTypeSelection;
     if (!pickedId) return;
@@ -920,7 +914,7 @@ export default function App() {
   }
 
   async function confirmModuleSelection() {
-    if (!response || response.step !== 'awaiting_modules') return;
+    if (!response || response.step !== 'modules') return;
     if (loading) return;
     if (moduleSelection.length === 0) return;
     const names = moduleSelection
@@ -935,16 +929,16 @@ export default function App() {
     ]);
     const parsedCopyCount = Number.parseInt(copyModuleCount, 10);
     const normalizedCopyCount = Number.isInteger(parsedCopyCount) && parsedCopyCount > 0 ? parsedCopyCount : 1;
-    const payload: SessionMessagePayload = { moduleIds: [...moduleSelection] };
+    /** Same wire the server builds from `moduleIds` / `modules` JSON — graph parses `message` only. */
+    let wire = `moduleIds exactly ${JSON.stringify([...moduleSelection])}`;
     if (copyEachModule) {
-      payload.copyEachSelectedModule = true;
-      payload.copyModuleCount = normalizedCopyCount;
+      wire += ` copyEachSelectedModule: true copyModuleCount: ${normalizedCopyCount}`;
     }
-    await sendMessage(payload);
+    await sendMessage(wire);
   }
 
   async function confirmRotationRangeSelection() {
-    if (!response || response.step !== 'awaiting_rotation_range') return;
+    if (!response || response.step !== 'rotation_range') return;
     if (loading) return;
     const totalRotations = Math.max(
       1,
@@ -1006,7 +1000,7 @@ export default function App() {
               </div>
             </div>
           ))}
-          {response?.step === 'awaiting_students' && (
+          {response?.step === 'students' && (
             <div className="msg-row msg-row-assistant">
               <div className="msg-meta">Assistant</div>
               <div className="bubble bubble-assistant bubble-embed bubble-embed-unified">
@@ -1093,11 +1087,11 @@ export default function App() {
               </div>
             </div>
           )}
-          {response?.step === 'awaiting_modules' && (
+          {response && (response.step === 'schedule_types' || response.step === 'modules') && (
             <div className="msg-row msg-row-assistant">
               <div className="msg-meta">Assistant</div>
               <div className="bubble bubble-assistant bubble-embed bubble-embed-unified">
-                {(response.modules?.length ?? 0) === 0 && (response.scheduleTypes?.length ?? 0) > 0
+                {response.step === 'schedule_types'
                   ? scheduleTypePickerIntroText(response.assistantMessage).map((para, i) => (
                       <p key={i} className="bubble-text bubble-text-tight">
                         {para}
@@ -1112,7 +1106,7 @@ export default function App() {
                         {para}
                       </p>
                     ))}
-                {(response.modules?.length ?? 0) === 0 && (response.scheduleTypes?.length ?? 0) > 0 && (
+                {response.step === 'schedule_types' && (
                   <>
                     <div className="inline-pick-head" aria-hidden>
                       <span className="inline-pick-head-num">#</span>
@@ -1152,7 +1146,7 @@ export default function App() {
                     </div>
                   </>
                 )}
-                {(response.modules?.length ?? 0) > 0 && (
+                {response.step === 'modules' && (
                   <>
                     <div className="inline-pick-head" aria-hidden>
                       <span className="inline-pick-head-num">#</span>
@@ -1267,7 +1261,7 @@ export default function App() {
               </div>
             </div>
           )}
-          {response?.step === 'awaiting_rotation_range' && (
+          {response?.step === 'rotation_range' && (
             <div className="msg-row msg-row-assistant">
               <div className="msg-meta">Assistant</div>
               <div className="bubble bubble-assistant bubble-embed bubble-embed-unified">
