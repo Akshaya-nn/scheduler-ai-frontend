@@ -210,12 +210,7 @@ Once `active`, the backend’s `step` field drives UI affordances:
    - Header adapts: `Module` vs `Expedition` based on `selectedScheduleType.type`.
    - Items already on the current generated schedule are marked with `Yes` in a **Selected** column so users know what to retain.
    - **Copy module** toggle (`copyEachModule`, default `true`) adds an additional row per selected module to accommodate overflow students.
-   - `confirmModuleSelection()` sends:
-     ```
-     I confirm these modules for the rotation: <names>.
-     Call select_modules with moduleIds exactly [...]. copyEachSelectedModule: true.
-     Then continue the workflow.
-     ```
+   - `confirmModuleSelection()` sends a JSON **`moduleIds`** array on the request body (no stringified `[...]` in `message`). Optional `copyEachSelectedModule` / `copyModuleCount` match the DTO. The server turns that into an internal comma-separated wire for the graph.
 
 6. **Free‑form conversational steps**
    - `awaiting_rotation_count`, `awaiting_rotation_capacity_decision`, `awaiting_pairing`, and `ready_to_generate` all use the composer only. The FE just forwards the user’s text to `/session/message`.

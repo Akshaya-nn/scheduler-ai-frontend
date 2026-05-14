@@ -740,16 +740,40 @@ export default function App() {
     }
   }
 
-  async function sendMessage(message: string) {
+  type SessionModuleIdsPayload = {
+    moduleIds: string[];
+    copyEachSelectedModule?: boolean;
+    copyModuleCount?: number;
+  };
+
+  async function sendMessage(payload: string | SessionModuleIdsPayload) {
     const activeSessionId = sessionId;
     if (!activeSessionId) return;
     setLoading(true);
     setError('');
     try {
+      const body =
+        typeof payload === 'string'
+          ? { sessionId: activeSessionId, message: payload }
+          : {
+              sessionId: activeSessionId,
+              moduleIds: payload.moduleIds,
+              ...(payload.copyEachSelectedModule === true
+                ? {
+                    copyEachSelectedModule: true,
+                    copyModuleCount:
+                      typeof payload.copyModuleCount === 'number' &&
+                      Number.isInteger(payload.copyModuleCount) &&
+                      payload.copyModuleCount >= 1
+                        ? payload.copyModuleCount
+                        : 1,
+                  }
+                : {}),
+            };
       const res = await fetch(`${apiBase}/ai-rotational/session/message`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ sessionId: activeSessionId, message }),
+        body: JSON.stringify(body),
       });
       const raw = (await res.json()) as Record<string, unknown>;
       const unwrapped = unwrapAiRotationalPayload(raw) as Record<string, unknown>;
@@ -929,12 +953,12 @@ export default function App() {
     ]);
     const parsedCopyCount = Number.parseInt(copyModuleCount, 10);
     const normalizedCopyCount = Number.isInteger(parsedCopyCount) && parsedCopyCount > 0 ? parsedCopyCount : 1;
-    /** Same wire the server builds from `moduleIds` / `modules` JSON — graph parses `message` only. */
-    let wire = `moduleIds exactly ${JSON.stringify([...moduleSelection])}`;
+    const payload: SessionModuleIdsPayload = { moduleIds: [...moduleSelection] };
     if (copyEachModule) {
-      wire += ` copyEachSelectedModule: true copyModuleCount: ${normalizedCopyCount}`;
+      payload.copyEachSelectedModule = true;
+      payload.copyModuleCount = normalizedCopyCount;
     }
-    await sendMessage(wire);
+    await sendMessage(payload);
   }
 
   async function confirmRotationRangeSelection() {
