@@ -23,6 +23,8 @@ type ScheduleTypeItem = { id: string; name: string; type: string };
 type SeatCell = { 0: { id: string; fullName: string }; 1: { id: string; fullName: string } };
 
 type ApiResponse = {
+  statusCode?: number;
+  success?: boolean;
   sessionId: string;
   step:
     | 'awaiting_students'
@@ -34,6 +36,7 @@ type ApiResponse = {
     | 'ready_to_generate'
     | 'completed';
   assistantMessage: string;
+  rotationRangeMax?: number;
   students: Student[];
   modules: ModuleItem[];
   scheduleTypes?: ScheduleTypeItem[];
@@ -54,6 +57,57 @@ type ApiResponse = {
     restrictCrossScheduleModuleRepeat?: boolean;
   };
 };
+
+/** Merge a shaped server payload into full client state (server omits unchanged lists). */
+function mergePartialAiResponse(prev: ApiResponse | null, incoming: Record<string, unknown>): ApiResponse {
+  const i = incoming as Partial<ApiResponse>;
+  const students = i.students !== undefined ? i.students : (prev?.students ?? []);
+  const step = (i.step ?? prev?.step ?? 'awaiting_modules') as ApiResponse['step'];
+  let modules = i.modules !== undefined ? i.modules : (prev?.modules ?? []);
+  /**
+   * Schedule-type-only turns omit `modules`; without this, merged state keeps the old catalog and
+   * the UI shows the module checklist while the assistant asks for a schedule type.
+   */
+  if (
+    i.modules === undefined &&
+    i.scheduleTypes !== undefined &&
+    Array.isArray(i.scheduleTypes) &&
+    i.scheduleTypes.length > 0 &&
+    step === 'awaiting_modules'
+  ) {
+    modules = [];
+  }
+  const mergedScheduleTypesForPicker =
+    i.scheduleTypes !== undefined ? i.scheduleTypes : prev?.scheduleTypes;
+  const scheduleTypeListActive =
+    step === 'awaiting_modules' &&
+    Array.isArray(mergedScheduleTypesForPicker) &&
+    mergedScheduleTypesForPicker.length > 0 &&
+    modules.length === 0;
+  const selectedModules = i.selectedModules !== undefined
+    ? i.selectedModules
+    : scheduleTypeListActive
+      ? []
+      : (prev?.selectedModules ?? []);
+  return {
+    statusCode: i.statusCode ?? prev?.statusCode,
+    success: i.success ?? prev?.success,
+    sessionId: (i.sessionId ?? prev?.sessionId ?? '') as string,
+    step: (i.step ?? prev?.step ?? 'awaiting_modules') as ApiResponse['step'],
+    assistantMessage: (i.assistantMessage ?? prev?.assistantMessage ?? '') as string,
+    rotationRangeMax: i.rotationRangeMax !== undefined ? i.rotationRangeMax : prev?.rotationRangeMax,
+    students,
+    modules,
+    scheduleTypes: i.scheduleTypes !== undefined ? i.scheduleTypes : prev?.scheduleTypes,
+    selectedScheduleType:
+      i.selectedScheduleType !== undefined ? i.selectedScheduleType : prev?.selectedScheduleType,
+    selectedStudents:
+      i.selectedStudents !== undefined ? i.selectedStudents : (prev?.selectedStudents ?? students),
+    selectedModules,
+    schedule: i.schedule !== undefined ? i.schedule : (prev?.schedule ?? null),
+    config: i.config !== undefined ? i.config : prev?.config,
+  };
+}
 
 const apiBase = 'http://localhost:8080/v2';
 
@@ -130,17 +184,22 @@ function studentPickerIntroText(assistantMessage: string): string[] {
 /** True when the assistant message is asking the user to pick a schedule type. */
 function isScheduleTypePrompt(assistantMessage: string): boolean {
   const raw = (assistantMessage ?? '').trim();
-  return (
-    /\b(module\s*type|schedule\s*type|content\s*type|kind\s+of\s+rotational\s+schedule)\b/i.test(raw) &&
-    /^\s*\d+\s*[\.\)]\s*\S/m.test(raw)
-  );
+  const hasNumberedTypes = /^\s*\d+\s*[\.\)]\s*\S/m.test(raw);
+  const asksScheduleTypes =
+    /\b(module\s*type|schedule\s*types?|schedule\s+type|content\s*type|kind\s+of\s+rotational\s+schedule)\b/i.test(
+      raw,
+    ) ||
+    /\bchoose a \*\*schedule type\*\*/i.test(raw) ||
+    /\bpick\s+one\s+of\s+these\s+schedule\s+types\b/i.test(raw) ||
+    /\bselect\s+the\s+schedule\s+type\s+you\s+need\s+for\s+this\s+update\b/i.test(raw);
+  return asksScheduleTypes && hasNumberedTypes;
 }
 
 /** True when schedule-type response includes an error/retry explanation. */
 function isScheduleTypeRetryMessage(assistantMessage: string): boolean {
   const raw = (assistantMessage ?? '').trim();
   return (
-    /\b(could not match|no active items available|please choose another schedule type|select one from the list)\b/i.test(
+    /\b(could not match|that did not match|no active items available|please choose another schedule type|select one from the list)\b/i.test(
       raw,
     ) && isScheduleTypePrompt(raw)
   );
@@ -157,6 +216,8 @@ function isAwaitingModulesTimelineAssistantSurface(raw: string): boolean {
   if (isScheduleTypeRetryMessage(t)) return true;
   if (/^great\b/i.test(t) && /\bhere are the\b/i.test(t)) return false;
   if (/\bwhich kind of rotational schedule\b/i.test(t)) return false;
+  if (/\bchoose a \*\*schedule type\*\*/i.test(t)) return false;
+  if (/\bselect\s+the\s+schedule\s+type\s+you\s+need\s+for\s+this\s+update\b/i.test(t)) return false;
   if (
     /\b(current capacity|must fit across module rows|please increase module rows\b|one or more module ids are invalid|no modules selected)\b/i.test(
       t,
@@ -168,6 +229,26 @@ function isAwaitingModulesTimelineAssistantSurface(raw: string): boolean {
     return true;
   }
   return false;
+}
+
+/** Intro for the inline schedule-type radio list (modules empty). */
+function scheduleTypePickerIntroText(assistantMessage: string): string[] {
+  const raw = (assistantMessage ?? '').trim();
+  const stripped = stripNumberedListLines(raw);
+  const isUpdateFlow =
+    /previously\s+selected|for\s+this\s+update|need\s+for\s+this\s+update/i.test(raw) ||
+    /\bselect\s+the\s+schedule\s+type\s+you\s+need\b/i.test(raw);
+  if (!stripped) {
+    return [
+      isUpdateFlow
+        ? 'Select the schedule type you need for this update, then tap **Confirm selection**. You can also reply with the type name or number in the chat.'
+        : 'Choose the schedule type for this class, then tap **Confirm selection**. You can also reply with the type name or number in the chat.',
+    ];
+  }
+  return stripped
+    .split(/\n{2,}/)
+    .map((p) => p.trim())
+    .filter((p) => p.length > 0);
 }
 
 /** Intro paragraphs for the unified module picker (no numbered module lines). */
@@ -429,7 +510,6 @@ export default function App() {
   const [completedSchedules, setCompletedSchedules] = useState<CompletedScheduleEntry[]>([]);
   const [chatInput, setChatInput] = useState('');
   const [chatMode, setChatMode] = useState<ChatMode>('awaiting_intent');
-  const [seedScheduleIntent, setSeedScheduleIntent] = useState('');
   const [loading, setLoading] = useState(false);
   const [response, setResponse] = useState<ApiResponse | null>(null);
   /** Keeps the last generated grid if a later API message omits `schedule`. */
@@ -446,7 +526,7 @@ export default function App() {
     {
       id: nextMessageId(),
       role: 'assistant',
-      text: 'Hello! Ask to create a rotational schedule, then enter your class ID. ',
+      text: 'Hello! I’m your AI Assistant for creating smart rotational schedules.',
     },
   ]);
 
@@ -540,10 +620,19 @@ export default function App() {
     if (!response || response.step !== 'awaiting_rotation_range') {
       return;
     }
-    const totalRotations = Math.max(1, response.schedule?.colCount ?? response.config?.endRotation ?? 1);
+    const totalRotations = Math.max(
+      1,
+      response.rotationRangeMax ?? response.schedule?.colCount ?? response.config?.endRotation ?? 1,
+    );
     setStartRotationSelection('1');
     setEndRotationSelection(String(Math.min(totalRotations, 2)));
-  }, [response?.sessionId, response?.step, response?.schedule?.colCount, response?.config?.endRotation]);
+  }, [
+    response?.sessionId,
+    response?.step,
+    response?.rotationRangeMax,
+    response?.schedule?.colCount,
+    response?.config?.endRotation,
+  ]);
 
   const normalizedSchedule = response ? pickScheduleFromPayload(response) : null;
   /** Keep showing the last grid when reopening module/student pick after `completed` (API may omit `schedule` on interrupt steps). */
@@ -610,19 +699,22 @@ export default function App() {
 
   const canSend = chatInput.trim().length > 0 && !loading;
 
-  async function startSession(classId: string, initialIntent?: string) {
+  async function startSession(classId: string) {
     setLoading(true);
     setError('');
     try {
-      const res = await fetch(`${apiBase}/ai-rotational/session/start`, {
+      const res = await fetch(`${apiBase}/ai-rotational/session/message`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ classId, initialMessage: initialIntent?.trim() || undefined }),
+        body: JSON.stringify({ classId }),
       });
       const raw = (await res.json()) as Record<string, unknown>;
-      const data = unwrapAiRotationalPayload(raw) as ApiResponse;
+      const unwrapped = unwrapAiRotationalPayload(raw) as Record<string, unknown>;
+      const data = mergePartialAiResponse(null, unwrapped);
       if (!res.ok) {
-        throw new Error((data as unknown as { message?: string })?.message ?? 'Failed to start session');
+        throw new Error(
+          String((raw as { message?: string }).message ?? (unwrapped as { message?: string }).message ?? 'Failed to start session'),
+        );
       }
       setResponse(data);
       setSessionId(data.sessionId);
@@ -643,26 +735,40 @@ export default function App() {
     }
   }
 
-  async function sendMessage(message: string) {
+  type SessionMessagePayload = {
+    message?: string;
+    moduleIds?: string[];
+    copyEachSelectedModule?: boolean;
+    copyModuleCount?: number;
+  };
+
+  async function sendMessage(payload: string | SessionMessagePayload) {
     const activeSessionId = sessionId;
     if (!activeSessionId) return;
     setLoading(true);
     setError('');
     try {
+      const body: SessionMessagePayload & { sessionId: string } =
+        typeof payload === 'string'
+          ? { sessionId: activeSessionId, message: payload }
+          : { sessionId: activeSessionId, ...payload };
       const res = await fetch(`${apiBase}/ai-rotational/session/message`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ sessionId: activeSessionId, message }),
+        body: JSON.stringify(body),
       });
       const raw = (await res.json()) as Record<string, unknown>;
-      const data = unwrapAiRotationalPayload(raw) as ApiResponse;
+      const unwrapped = unwrapAiRotationalPayload(raw) as Record<string, unknown>;
       if (!res.ok) {
-        throw new Error((data as unknown as { message?: string })?.message ?? 'Message failed');
+        throw new Error(
+          String((raw as { message?: string }).message ?? (unwrapped as { message?: string }).message ?? 'Message failed'),
+        );
       }
-      setResponse(data);
-      setPersistedSchedule((prev) => mergePersistedSchedule(data, prev));
+      const merged = mergePartialAiResponse(response, unwrapped);
+      setResponse(merged);
+      setPersistedSchedule((prev) => mergePersistedSchedule(merged, prev));
       appendMessages(
-        nonEmptyChunks(assistantChunksAfterResponse(data)).map((text) => ({
+        nonEmptyChunks(assistantChunksAfterResponse(merged)).map((text) => ({
           role: 'assistant' as const,
           text,
           preformatted: text.includes('| --- |'),
@@ -700,7 +806,6 @@ export default function App() {
     setCopyModuleCount('1');
     setError('');
     setChatMode('awaiting_class_id');
-    setSeedScheduleIntent(triggerMessage);
     lastScrolledScheduleFingerprintRef.current = null;
     completedScheduleEverRef.current = false;
     moduleCapacityScrollDoneForMessageIdRef.current = null;
@@ -731,14 +836,22 @@ export default function App() {
       const inlineClassId = extractClassIdFromMessage(message);
       const handled = archiveCurrentScheduleAndResetForNewFlow(message);
       if (handled && inlineClassId) {
-        setSeedScheduleIntent('');
-        await startSession(inlineClassId, message);
+        await startSession(inlineClassId);
       }
       return;
     }
 
     if (!sessionId) {
       if (chatMode === 'awaiting_intent') {
+        /**
+         * Accept a bare Mongo ObjectId (or message that contains one) before
+         * requiring rotational phrasing — matches "paste class ID only" UX.
+         */
+        const inlineClassIdEarly = extractClassIdFromMessage(message);
+        if (inlineClassIdEarly) {
+          await startSession(inlineClassIdEarly);
+          return;
+        }
         if (!isRotationalIntent(message)) {
           appendMessages([
             {
@@ -748,13 +861,6 @@ export default function App() {
           ]);
           return;
         }
-        const inlineClassId = extractClassIdFromMessage(message);
-        if (inlineClassId) {
-          setSeedScheduleIntent('');
-          await startSession(inlineClassId, message);
-          return;
-        }
-        setSeedScheduleIntent(message);
         setChatMode('awaiting_class_id');
         appendMessages([{ role: 'assistant', text: 'Please provide the class ID.' }]);
         return;
@@ -769,10 +875,7 @@ export default function App() {
         ]);
         return;
       }
-      const remainingIntent = message.replace(inlineClassId, ' ').replace(/\s+/g, ' ').trim();
-      const composedIntent = [seedScheduleIntent.trim(), remainingIntent].filter((part) => part.length > 0).join('. ');
-      await startSession(inlineClassId, composedIntent || undefined);
-      setSeedScheduleIntent('');
+      await startSession(inlineClassId);
       return;
     }
     await sendMessage(message);
@@ -830,21 +933,23 @@ export default function App() {
         items: names,
       },
     ]);
-    const idsJson = JSON.stringify(moduleSelection);
     const parsedCopyCount = Number.parseInt(copyModuleCount, 10);
     const normalizedCopyCount = Number.isInteger(parsedCopyCount) && parsedCopyCount > 0 ? parsedCopyCount : 1;
-    const copyPart = copyEachModule
-      ? ` copyEachSelectedModule: true. copyModuleCount: ${normalizedCopyCount}.`
-      : '';
-    await sendMessage(
-      `I confirm these modules for the rotation: ${names.join(', ')}. Call select_modules with moduleIds exactly ${idsJson}.${copyPart} Then continue the workflow.`,
-    );
+    const payload: SessionMessagePayload = { moduleIds: [...moduleSelection] };
+    if (copyEachModule) {
+      payload.copyEachSelectedModule = true;
+      payload.copyModuleCount = normalizedCopyCount;
+    }
+    await sendMessage(payload);
   }
 
   async function confirmRotationRangeSelection() {
     if (!response || response.step !== 'awaiting_rotation_range') return;
     if (loading) return;
-    const totalRotations = Math.max(1, response.schedule?.colCount ?? response.config?.endRotation ?? 1);
+    const totalRotations = Math.max(
+      1,
+      response.rotationRangeMax ?? response.schedule?.colCount ?? response.config?.endRotation ?? 1,
+    );
     const start = Number.parseInt(startRotationSelection, 10);
     const end = Number.parseInt(endRotationSelection, 10);
     if (!Number.isInteger(start) || !Number.isInteger(end)) return;
@@ -992,15 +1097,21 @@ export default function App() {
             <div className="msg-row msg-row-assistant">
               <div className="msg-meta">Assistant</div>
               <div className="bubble bubble-assistant bubble-embed bubble-embed-unified">
-                {modulePickerIntroText(
-                  response.assistantMessage,
-                  response.selectedModules?.length ?? 0,
-                  (response.modules?.length ?? 0) > 0,
-                ).map((para, i) => (
-                  <p key={i} className="bubble-text bubble-text-tight">
-                    {para}
-                  </p>
-                ))}
+                {(response.modules?.length ?? 0) === 0 && (response.scheduleTypes?.length ?? 0) > 0
+                  ? scheduleTypePickerIntroText(response.assistantMessage).map((para, i) => (
+                      <p key={i} className="bubble-text bubble-text-tight">
+                        {para}
+                      </p>
+                    ))
+                  : modulePickerIntroText(
+                      response.assistantMessage,
+                      response.selectedModules?.length ?? 0,
+                      (response.modules?.length ?? 0) > 0,
+                    ).map((para, i) => (
+                      <p key={i} className="bubble-text bubble-text-tight">
+                        {para}
+                      </p>
+                    ))}
                 {(response.modules?.length ?? 0) === 0 && (response.scheduleTypes?.length ?? 0) > 0 && (
                   <>
                     <div className="inline-pick-head" aria-hidden>
@@ -1213,11 +1324,13 @@ export default function App() {
                       !response ||
                       (() => {
                         const total = Math.max(1, response.schedule?.colCount ?? response.config?.endRotation ?? 1);
+                        const maxFromApi = response.rotationRangeMax;
+                        const totalRotations = Math.max(1, maxFromApi ?? total);
                         const s = Number.parseInt(startRotationSelection, 10);
                         const e = Number.parseInt(endRotationSelection, 10);
                         if (!Number.isInteger(s) || !Number.isInteger(e)) return true;
-                        if (s < 1 || s >= total) return true;
-                        if (e <= s || e > total) return true;
+                        if (s < 1 || s >= totalRotations) return true;
+                        if (e <= s || e > totalRotations) return true;
                         return false;
                       })()
                     }
