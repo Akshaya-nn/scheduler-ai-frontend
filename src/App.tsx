@@ -22,7 +22,7 @@ type ModuleItem = { id: string; name: string };
 type ScheduleTypeItem = { id: string; name: string; type: string };
 type SeatCell = { 0: { id: string; fullName: string }; 1: { id: string; fullName: string } };
 
-/** Public API `step` — what the client should show next (matches server `SelectionStep`). */
+/** Public API `step` â€” what the client should show next (matches server `SelectionStep`). */
 type ResponseStep =
   | 'schedule_types'
   | 'modules'
@@ -111,6 +111,40 @@ function mergePartialAiResponse(prev: ApiResponse | null, incoming: Record<strin
 
 const apiBase = 'http://localhost:8080/v2';
 
+type ChatPicker =
+  | {
+      kind: 'schedule_types';
+      frozen: boolean;
+      intro: string[];
+      options: ScheduleTypeItem[];
+      selectedId?: string;
+    }
+  | {
+      kind: 'modules';
+      frozen: boolean;
+      intro: string[];
+      modules: ModuleItem[];
+      selectedIds: string[];
+      copyEachModule: boolean;
+      copyModuleCount: string;
+      contentLabel: string;
+    }
+  | {
+      kind: 'students';
+      frozen: boolean;
+      intro: string[];
+      students: Student[];
+      selectedIds: string[];
+    }
+  | {
+      kind: 'rotation_range';
+      frozen: boolean;
+      intro: string;
+      start: string;
+      end: string;
+      maxEnd: number;
+    };
+
 type ChatMessage = {
   id: string;
   role: 'assistant' | 'user';
@@ -123,6 +157,11 @@ type ChatMessage = {
   isError?: boolean;
   /** Preserve markdown-style tables without collapsing whitespace */
   preformatted?: boolean;
+  /** Frozen schedule grid shown inside the chat bubble */
+  schedule?: NonNullable<ApiResponse['schedule']>;
+  showSavePrompt?: boolean;
+  /** Inline checklist / picker (single assistant bubble â€” no duplicate text above) */
+  picker?: ChatPicker;
 };
 
 type ChatMode = 'awaiting_intent' | 'awaiting_class_id' | 'active';
@@ -208,7 +247,7 @@ function isScheduleTypeRetryMessage(assistantMessage: string): boolean {
 /**
  * When step is `modules` or `schedule_types`, most assistant text is only shown inside the inline picker.
  * Capacity / validation replies must also appear as timeline bubbles so the flow reads
- * user → assistant → user, not several user rows with no visible reply.
+ * user â†’ assistant â†’ user, not several user rows with no visible reply.
  */
 function isAwaitingModulesTimelineAssistantSurface(raw: string): boolean {
   const t = (raw ?? '').trim();
@@ -269,7 +308,7 @@ function modulePickerIntroText(
   const lines: string[] = [];
   if (!looksLikeScheduleTypePrompt && preselectedModuleCount > 0) {
     lines.push(
-      `${preselectedModuleCount} item${preselectedModuleCount === 1 ? '' : 's'} marked Selected are already on your current schedule—keep them checked to retain them, tick more to add, then confirm.`,
+      `${preselectedModuleCount} item${preselectedModuleCount === 1 ? '' : 's'} marked Selected are already on your current scheduleâ€”keep them checked to retain them, tick more to add, then confirm.`,
     );
   }
   if (stripped) {
@@ -297,44 +336,171 @@ function modulePickerIntroText(
   return lines;
 }
 
-/** Split the model reply into chat bubbles; backend is the single source of truth (OpenAI + tools). */
-function assistantChunksAfterResponse(data: ApiResponse): string[] {
-  if (data.step === 'students') {
-    return [];
-  }
-  if (data.step === 'modules' || data.step === 'schedule_types') {
-    const rawAwaitingModules = (data.assistantMessage ?? '').trim();
-    if (isAwaitingModulesTimelineAssistantSurface(rawAwaitingModules)) {
-      return [stripNumberedListLines(rawAwaitingModules)];
-    }
-    return [];
-  }
-  if (data.step === 'rotation_range') {
-    return [];
-  }
-  if (data.step === 'plan') {
-    const planText = (data.assistantMessage ?? '').trim();
-    return planText ? [planText] : ['…'];
-  }
+function assistantMessageLooksLikeError(text: string): boolean {
+  const t = text.trim();
+  if (!t) return false;
+  return /\b(cannot fit|could not|invalid|not valid|must fit|error|failed|no active|please (choose|increase|reduce)|widen the range)\b/i.test(
+    t,
+  );
+}
+
+/** Every API turn appends assistant content to the chat timeline (lists/errors stay in thread). */
+function buildAssistantChatEntriesFromResponse(data: ApiResponse): Omit<ChatMessage, 'id'>[] {
   const raw = (data.assistantMessage ?? '').trim();
+  const grid = pickScheduleFromPayload(data);
+  const step = data.step;
+
+  if (grid && (step === 'completed' || step === 'schedule')) {
+    return [
+      {
+        role: 'assistant',
+        text: raw || 'Here is your generated schedule.',
+        schedule: grid,
+        /** API maps internal `completed` + grid → public step `schedule`; show save footer for both. */
+        showSavePrompt: true,
+      },
+    ];
+  }
+
+  if (step === 'students') {
+    return [
+      {
+        role: 'assistant',
+        picker: {
+          kind: 'students',
+          frozen: false,
+          intro: studentPickerIntroText(raw),
+          students: data.students ?? [],
+          selectedIds: (data.selectedStudents ?? []).map((s) => s.id),
+        },
+      },
+    ];
+  }
+
+  if (step === 'schedule_types') {
+    if (isScheduleTypeRetryMessage(raw)) {
+      return [{ role: 'assistant', text: stripNumberedListLines(raw), isError: true }];
+    }
+    return [
+      {
+        role: 'assistant',
+        picker: {
+          kind: 'schedule_types',
+          frozen: false,
+          intro: scheduleTypePickerIntroText(raw),
+          options: data.scheduleTypes ?? [],
+        },
+      },
+    ];
+  }
+
+  if (step === 'modules') {
+    if (isAwaitingModulesTimelineAssistantSurface(raw)) {
+      return [
+        {
+          role: 'assistant',
+          text: stripNumberedListLines(raw),
+          isError: assistantMessageLooksLikeError(raw),
+        },
+      ];
+    }
+    return [
+      {
+        role: 'assistant',
+        picker: {
+          kind: 'modules',
+          frozen: false,
+          intro: modulePickerIntroText(
+            raw,
+            data.selectedModules?.length ?? 0,
+            (data.modules?.length ?? 0) > 0,
+          ),
+          modules: data.modules ?? [],
+          selectedIds: [
+            ...new Set(
+              (data.selectedModules ?? []).map((m) => catalogIdFromExpandedModuleRowId(m.id)),
+            ),
+          ],
+          copyEachModule: false,
+          copyModuleCount: '1',
+          contentLabel: data.selectedScheduleType?.type === 'expedition' ? 'Expedition' : 'Module',
+        },
+      },
+    ];
+  }
+
+  if (step === 'rotation_range') {
+    const maxEnd = Math.max(
+      2,
+      data.rotationRangeMax ?? data.config?.endRotation ?? data.schedule?.colCount ?? 2,
+    );
+    return [
+      {
+        role: 'assistant',
+        picker: {
+          kind: 'rotation_range',
+          frozen: false,
+          intro: 'Select the start and end rotation count to update, then confirm.',
+          start: String(data.config?.startRotation ?? 1),
+          end: String(data.config?.endRotation ?? maxEnd),
+          maxEnd,
+        },
+      },
+    ];
+  }
+
+  if (step === 'plan') {
+    return raw ? [{ role: 'assistant', text: raw }] : [{ role: 'assistant', text: 'â€¦' }];
+  }
+
   if (!raw) {
-    return ['…'];
+    return [{ role: 'assistant', text: 'â€¦' }];
   }
   if (raw.includes('| --- |')) {
-    return [raw];
+    return [{ role: 'assistant', text: raw, preformatted: true }];
   }
   if (/^Here's the plan based on your selection:/i.test(raw)) {
-    return [raw];
+    return [{ role: 'assistant', text: raw }];
   }
   const parts = raw
     .split(/\n{2,}/)
     .map((line) => line.trim())
     .filter((line) => line.length > 0);
-  return parts.length > 0 ? parts : [raw];
+  const chunks = parts.length > 0 ? parts : [raw];
+  return chunks.map((text) => ({
+    role: 'assistant' as const,
+    text,
+    preformatted: text.includes('| --- |'),
+    isError: assistantMessageLooksLikeError(text),
+  }));
 }
 
-function nonEmptyChunks(chunks: string[]): string[] {
-  return chunks.map((c) => c.trim()).filter((c) => c.length > 0);
+function filterNewScheduleChatEntries(
+  entries: Omit<ChatMessage, 'id'>[],
+  lastScheduleFingerprintRef: { current: string | null },
+): Omit<ChatMessage, 'id'>[] {
+  const out: Omit<ChatMessage, 'id'>[] = [];
+  for (const entry of entries) {
+    if (!entry.schedule) {
+      out.push(entry);
+      continue;
+    }
+    const fp = scheduleFingerprint(entry.schedule);
+    if (fp === lastScheduleFingerprintRef.current) {
+      if (entry.text?.trim()) {
+        out.push({
+          role: 'assistant',
+          text: entry.text,
+          isError: entry.isError,
+          preformatted: entry.preformatted,
+        });
+      }
+      continue;
+    }
+    lastScheduleFingerprintRef.current = fp;
+    out.push(entry);
+  }
+  return out;
 }
 
 /** API JSON uses string keys "0" / "1" for the two seat slots. */
@@ -447,7 +613,13 @@ function mergePersistedSchedule(data: ApiResponse, previous: ApiResponse['schedu
   if (picked !== null) {
     return picked;
   }
-  if (data.step === 'completed' || data.step === 'modules' || data.step === 'schedule_types' || data.step === 'students') {
+  if (
+    data.step === 'completed' ||
+    data.step === 'schedule' ||
+    data.step === 'modules' ||
+    data.step === 'schedule_types' ||
+    data.step === 'students'
+  ) {
     return previous;
   }
   return null;
@@ -458,13 +630,22 @@ function catalogIdFromExpandedModuleRowId(id: string): string {
   return id.replace(/::__copy_\d+(?:_\d+)?$/i, '');
 }
 
-function ScheduleGridTable({ schedule }: { schedule: NonNullable<ApiResponse['schedule']> }) {
+function ScheduleGridTable({
+  schedule,
+  scrollable = false,
+  savePrompt,
+}: {
+  schedule: NonNullable<ApiResponse['schedule']>;
+  scrollable?: boolean;
+  savePrompt?: { onYes: () => void; onNo: () => void };
+}) {
   const rotationCols = scheduleRotationColumnCount(schedule);
   const orderedRows = scheduleRowDisplayOrder(schedule);
-  return (
-    <div className="schedule-table-wrap">
-      <table className="schedule-table">
-        <thead>
+  const useScroll = scrollable || Boolean(savePrompt);
+
+  const table = (
+    <table className="schedule-table">
+      <thead>
           <tr>
             <th>Module</th>
             {Array.from({ length: rotationCols }, (_, colIndex) => (
@@ -495,8 +676,30 @@ function ScheduleGridTable({ schedule }: { schedule: NonNullable<ApiResponse['sc
               </Fragment>
             );
           })}
-        </tbody>
-      </table>
+      </tbody>
+    </table>
+  );
+
+  if (!savePrompt) {
+    return (
+      <div className={`schedule-table-wrap${useScroll ? ' schedule-table-wrap--scroll' : ''}`}>{table}</div>
+    );
+  }
+
+  return (
+    <div className="schedule-card">
+      <div className="schedule-table-wrap schedule-table-wrap--scroll">{table}</div>
+      <footer className="schedule-save-prompt">
+        <p className="schedule-save-prompt-text">Would you like to save this schedule?</p>
+        <div className="schedule-save-actions">
+          <button className="btn btn-outline" type="button" onClick={savePrompt.onNo}>
+            No
+          </button>
+          <button className="btn primary" type="button" onClick={savePrompt.onYes}>
+            Yes, save
+          </button>
+        </div>
+      </footer>
     </div>
   );
 }
@@ -530,15 +733,14 @@ export default function App() {
     {
       id: nextMessageId(),
       role: 'assistant',
-      text: 'Hello! I’m your AI Assistant for creating smart rotational schedules.',
+      text: "Hello! I'm your AI Assistant for creating smart rotational schedules.",
     },
   ]);
 
   const chatThreadRef = useRef<HTMLDivElement>(null);
-  const schedulePanelRef = useRef<HTMLDivElement>(null);
-  /** Track last completed schedule snapshot that triggered auto-scroll to the grid. */
-  const lastScrolledScheduleFingerprintRef = useRef<string | null>(null);
-  /** True once the user has reached `completed` with a grid — used to skip chat auto-scroll during module-edit interrupts. */
+  /** Skip duplicate schedule cards in chat when the grid unchanged. */
+  const lastChatScheduleFingerprintRef = useRef<string | null>(null);
+  /** True once the user has reached `completed` with a grid â€” used to skip chat auto-scroll during module-edit interrupts. */
   const completedScheduleEverRef = useRef(false);
   /** Avoid double `scrollIntoView` in React Strict Mode for the same bubble. */
   const moduleCapacityScrollDoneForMessageIdRef = useRef<string | null>(null);
@@ -547,10 +749,138 @@ export default function App() {
     setChatMessages((prev) => [...prev, ...entries.map((e) => ({ ...e, id: nextMessageId() }))]);
   }, []);
 
+  const appendUserText = useCallback(
+    (text: string) => {
+      const trimmed = text.trim();
+      if (!trimmed) {
+        return;
+      }
+      appendMessages([{ role: 'user', text: trimmed }]);
+    },
+    [appendMessages],
+  );
+
+  const appendUserSelection = useCallback(
+    (heading: string, items: string[], footnote?: string) => {
+      if (items.length === 0) {
+        return;
+      }
+      appendMessages([
+        {
+          role: 'user',
+          heading,
+          items,
+          ...(footnote?.trim() ? { text: footnote.trim() } : {}),
+        },
+      ]);
+    },
+    [appendMessages],
+  );
+
   useEffect(() => {
-    lastScrolledScheduleFingerprintRef.current = null;
+    lastChatScheduleFingerprintRef.current = null;
     completedScheduleEverRef.current = false;
   }, [sessionId]);
+
+  /** If the user confirms via chat text, freeze any picker left open when the step advances. */
+  useEffect(() => {
+    if (!response) {
+      return;
+    }
+    const activeKind = stepToPickerKind(response.step);
+    setChatMessages((prev) =>
+      prev.map((m) => {
+        if (!m.picker || m.picker.frozen || m.picker.kind === activeKind) {
+          return m;
+        }
+        const p = m.picker;
+        if (p.kind === 'schedule_types') {
+          return {
+            ...m,
+            picker: { ...p, frozen: true, selectedId: scheduleTypeSelection || p.selectedId },
+          };
+        }
+        if (p.kind === 'modules') {
+          return {
+            ...m,
+            picker: {
+              ...p,
+              frozen: true,
+              selectedIds: moduleSelection.length > 0 ? [...moduleSelection] : p.selectedIds,
+              copyEachModule,
+              copyModuleCount,
+            },
+          };
+        }
+        if (p.kind === 'students') {
+          return {
+            ...m,
+            picker: {
+              ...p,
+              frozen: true,
+              selectedIds: studentSelection.length > 0 ? [...studentSelection] : p.selectedIds,
+            },
+          };
+        }
+        if (p.kind === 'rotation_range') {
+          return {
+            ...m,
+            picker: {
+              ...p,
+              frozen: true,
+              start: startRotationSelection,
+              end: endRotationSelection,
+            },
+          };
+        }
+        return m;
+      }),
+    );
+  }, [
+    response?.step,
+    response?.sessionId,
+    scheduleTypeSelection,
+    moduleSelection,
+    studentSelection,
+    copyEachModule,
+    copyModuleCount,
+    startRotationSelection,
+    endRotationSelection,
+  ]);
+
+  const appendAssistantEntriesFromResponse = useCallback((data: ApiResponse) => {
+    const entries = filterNewScheduleChatEntries(
+      buildAssistantChatEntriesFromResponse(data),
+      lastChatScheduleFingerprintRef,
+    );
+    if (entries.length === 0) {
+      return;
+    }
+    setChatMessages((prev) => {
+      const toAdd: ChatMessage[] = [];
+      for (const entry of entries) {
+        if (
+          entry.picker &&
+          prev.some((m) => m.picker?.kind === entry.picker!.kind && !m.picker.frozen)
+        ) {
+          continue;
+        }
+        toAdd.push({ ...entry, id: nextMessageId() });
+      }
+      return toAdd.length > 0 ? [...prev, ...toAdd] : prev;
+    });
+  }, []);
+
+  const freezePickerInChat = useCallback((kind: ChatPicker['kind'], finalize: (picker: ChatPicker) => ChatPicker) => {
+    setChatMessages((prev) =>
+      prev.map((m) => {
+        if (!m.picker || m.picker.kind !== kind || m.picker.frozen) {
+          return m;
+        }
+        return { ...m, picker: finalize(m.picker) };
+      }),
+    );
+  }, []);
 
   useEffect(() => {
     const last = chatMessages[chatMessages.length - 1];
@@ -624,20 +954,14 @@ export default function App() {
     if (!response || response.step !== 'rotation_range') {
       return;
     }
-    const finalRot = Math.max(
+    const maxEnd = Math.max(
       2,
       response.rotationRangeMax ?? response.config?.endRotation ?? response.schedule?.colCount ?? 2,
     );
-    let curStart = response.config?.startRotation ?? 1;
-    let curEnd = response.config?.endRotation ?? finalRot;
-    if (curStart < 1 || curStart >= finalRot) {
-      curStart = 1;
-    }
-    if (curEnd <= curStart || curEnd > finalRot) {
-      curEnd = finalRot;
-    }
-    setStartRotationSelection(String(curStart));
-    setEndRotationSelection(String(curEnd));
+    const curStart = response.config?.startRotation ?? 1;
+    const curEnd = response.config?.endRotation ?? maxEnd;
+    setStartRotationSelection(String(Math.min(Math.max(1, curStart), maxEnd - 1)));
+    setEndRotationSelection(String(Math.min(Math.max(curEnd, 2), maxEnd)));
   }, [
     response?.sessionId,
     response?.step,
@@ -672,33 +996,6 @@ export default function App() {
     if (grid) {
       completedScheduleEverRef.current = true;
     }
-  }, [response, sessionId, normalizedSchedule, persistedSchedule]);
-
-  /**
-   * Scroll to the generated schedule when a newly completed/updated grid is received.
-   * Plain chat messages should stay within the chat thread without yanking the page.
-   */
-  useEffect(() => {
-    if (!response || response.sessionId !== sessionId) {
-      return;
-    }
-    if (response.step !== 'completed') {
-      return;
-    }
-    const grid = normalizedSchedule;
-    if (!grid) {
-      return;
-    }
-    const fingerprint = scheduleFingerprint(grid);
-    if (lastScrolledScheduleFingerprintRef.current === fingerprint) {
-      return;
-    }
-    lastScrolledScheduleFingerprintRef.current = fingerprint;
-    requestAnimationFrame(() => {
-      requestAnimationFrame(() => {
-        schedulePanelRef.current?.scrollIntoView({ behavior: 'smooth', block: 'start' });
-      });
-    });
   }, [response, sessionId, normalizedSchedule, persistedSchedule]);
 
   const selectedStudentNamesSig = (response?.selectedStudents ?? []).map((s) => s.fullName).join('|');
@@ -738,9 +1035,7 @@ export default function App() {
       setModuleSelection([]);
       setCopyEachModule(false);
       setCopyModuleCount('1');
-      appendMessages(
-        nonEmptyChunks(assistantChunksAfterResponse(data)).map((text) => ({ role: 'assistant' as const, text })),
-      );
+      appendAssistantEntriesFromResponse(data);
     } catch (err) {
       setError((err as Error).message);
     } finally {
@@ -793,13 +1088,7 @@ export default function App() {
       const merged = mergePartialAiResponse(response, unwrapped);
       setResponse(merged);
       setPersistedSchedule((prev) => mergePersistedSchedule(merged, prev));
-      appendMessages(
-        nonEmptyChunks(assistantChunksAfterResponse(merged)).map((text) => ({
-          role: 'assistant' as const,
-          text,
-          preformatted: text.includes('| --- |'),
-        })),
-      );
+      appendAssistantEntriesFromResponse(merged);
     } catch (err) {
       setError((err as Error).message);
       appendMessages([{ role: 'assistant', text: `Something went wrong: ${(err as Error).message}`, isError: true }]);
@@ -832,13 +1121,13 @@ export default function App() {
     setCopyModuleCount('1');
     setError('');
     setChatMode('awaiting_class_id');
-    lastScrolledScheduleFingerprintRef.current = null;
+    lastChatScheduleFingerprintRef.current = null;
     completedScheduleEverRef.current = false;
     moduleCapacityScrollDoneForMessageIdRef.current = null;
     appendMessages([
       {
         role: 'assistant',
-        text: "Sure — let's create another rotational schedule. Please provide the new class ID.",
+        text: "Sure â€” let's create another rotational schedule. Please provide the new class ID.",
       },
     ]);
     return true;
@@ -851,7 +1140,7 @@ export default function App() {
       return;
     }
     setChatInput('');
-    appendMessages([{ role: 'user', text: message }]);
+    appendUserText(message);
 
     /**
      * After a schedule is generated, accept "create new schedule" / "another schedule" /
@@ -871,7 +1160,7 @@ export default function App() {
       if (chatMode === 'awaiting_intent') {
         /**
          * Accept a bare Mongo ObjectId (or message that contains one) before
-         * requiring rotational phrasing — matches "paste class ID only" UX.
+         * requiring rotational phrasing â€” matches "paste class ID only" UX.
          */
         const inlineClassIdEarly = extractClassIdFromMessage(message);
         if (inlineClassIdEarly) {
@@ -914,13 +1203,10 @@ export default function App() {
     const names = studentSelection
       .map((id) => response.students.find((s) => s.id === id)?.fullName ?? id)
       .filter(Boolean);
-    appendMessages([
-      {
-        role: 'user',
-        heading: `Selected students (${studentSelection.length})`,
-        items: names,
-      },
-    ]);
+    freezePickerInChat('students', (p) =>
+      p.kind === 'students' ? { ...p, frozen: true, selectedIds: [...studentSelection] } : p,
+    );
+    appendUserSelection(`Selected students (${names.length})`, names);
     const idsJson = JSON.stringify(studentSelection);
     await sendMessage(
       `I confirm these students for the rotation: ${names.join(', ')}. Call select_students with studentIds exactly ${idsJson}, then continue the workflow.`,
@@ -934,14 +1220,10 @@ export default function App() {
     if (!pickedId) return;
     const picked = (response.scheduleTypes ?? []).find((t) => t.id === pickedId);
     if (!picked) return;
-    appendMessages([
-      {
-        role: 'user',
-        heading: 'Selected schedule type',
-        items: [picked.name],
-      },
-    ]);
-    /** Send the human-readable name; backend resolver matches on name/type alias. */
+    freezePickerInChat('schedule_types', (p) =>
+      p.kind === 'schedule_types' ? { ...p, frozen: true, selectedId: pickedId } : p,
+    );
+    appendUserText(picked.name);
     await sendMessage(picked.name);
   }
 
@@ -952,15 +1234,23 @@ export default function App() {
     const names = moduleSelection
       .map((id) => response.modules.find((m) => m.id === id)?.name ?? id)
       .filter(Boolean);
-    appendMessages([
-      {
-        role: 'user',
-        heading: `Selected modules (${moduleSelection.length})`,
-        items: names,
-      },
-    ]);
+    freezePickerInChat('modules', (p) =>
+      p.kind === 'modules'
+        ? {
+            ...p,
+            frozen: true,
+            selectedIds: [...moduleSelection],
+            copyEachModule,
+            copyModuleCount,
+          }
+        : p,
+    );
     const parsedCopyCount = Number.parseInt(copyModuleCount, 10);
     const normalizedCopyCount = Number.isInteger(parsedCopyCount) && parsedCopyCount > 0 ? parsedCopyCount : 1;
+    const copyFootnote = copyEachModule
+      ? `Copy each module ${normalizedCopyCount} time${normalizedCopyCount === 1 ? '' : 's'}.`
+      : undefined;
+    appendUserSelection(`Selected modules (${names.length})`, names, copyFootnote);
     const payload: SessionModuleIdsPayload = { moduleIds: [...moduleSelection] };
     if (copyEachModule) {
       payload.copyEachSelectedModule = true;
@@ -969,40 +1259,380 @@ export default function App() {
     await sendMessage(payload);
   }
 
-  function rotationRangeValid(
-    start: number,
-    end: number,
-    finalRot: number,
-  ): boolean {
+  function rotationRangeSpanValid(start: number, end: number, maxEnd: number): boolean {
     if (!Number.isInteger(start) || !Number.isInteger(end)) return false;
-    if (start < 1 || start >= finalRot) return false;
-    if (end <= start || end > finalRot) return false;
+    if (start < 1 || start > maxEnd - 1) return false;
+    if (end <= start || end > maxEnd) return false;
     return true;
   }
 
   async function confirmRotationRangeSelection() {
     if (!response || response.step !== 'rotation_range') return;
     if (loading) return;
-    const finalRot = Math.max(
+    const maxEnd = Math.max(
       2,
       response.rotationRangeMax ?? response.config?.endRotation ?? response.schedule?.colCount ?? 2,
     );
     const start = Number.parseInt(startRotationSelection, 10);
     const end = Number.parseInt(endRotationSelection, 10);
-    if (!rotationRangeValid(start, end, finalRot)) return;
+    if (!rotationRangeSpanValid(start, end, maxEnd)) return;
 
-    appendMessages([
-      {
-        role: 'user',
-        heading: 'Selected rotation range',
-        items: [`Start rotation: ${start}`, `End rotation: ${end}`],
-      },
-    ]);
+    freezePickerInChat('rotation_range', (p) =>
+      p.kind === 'rotation_range' ? { ...p, frozen: true, start: String(start), end: String(end) } : p,
+    );
+    appendUserText(`Rotations ${start}–${end}`);
     await sendMessage(`start rotation exactly ${start} end rotation exactly ${end}`);
   }
 
+  function handleSaveScheduleYes(schedule: NonNullable<ApiResponse['schedule']>) {
+    setCompletedSchedules((prev) => [
+      ...prev,
+      {
+        id: `s-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
+        classId: currentClassId,
+        schedule,
+        generatedAt: Date.now(),
+      },
+    ]);
+    appendMessages([{ role: 'assistant', text: 'Schedule saved.' }]);
+  }
+
+  function handleSaveScheduleNo() {
+    appendMessages([{ role: 'assistant', text: 'OK â€” tell me if you want any other changes.' }]);
+  }
+
+  function stepToPickerKind(step: ResponseStep | undefined): ChatPicker['kind'] | null {
+    if (step === 'schedule_types') return 'schedule_types';
+    if (step === 'modules') return 'modules';
+    if (step === 'students') return 'students';
+    if (step === 'rotation_range') return 'rotation_range';
+    return null;
+  }
+
+  function renderInlinePicker(message: ChatMessage) {
+    const picker = message.picker;
+    if (!picker) {
+      return null;
+    }
+    const activeKind = stepToPickerKind(response?.step);
+    const interactive = !picker.frozen && picker.kind === activeKind && !loading;
+
+    if (picker.kind === 'schedule_types') {
+      const selectedId = interactive ? scheduleTypeSelection : (picker.selectedId ?? '');
+      return (
+        <div className={`bubble-embed-unified${picker.frozen ? ' bubble-embed-frozen' : ''}`}>
+          {picker.intro.map((para, i) => (
+            <p key={i} className="bubble-text bubble-text-tight">
+              {para}
+            </p>
+          ))}
+          <div className="inline-pick-head" aria-hidden>
+            <span className="inline-pick-head-num">#</span>
+            <span className="inline-pick-head-ch"> </span>
+            <span className="inline-pick-head-name">Schedule type</span>
+          </div>
+          <ul className="inline-pick-list inline-pick-list-numbered" aria-label="Schedule types">
+            {picker.options.map((item, index) => (
+              <li key={item.id}>
+                <label className="inline-pick-row inline-pick-row-numbered inline-pick-row-modules">
+                  <span className="inline-pick-number" aria-hidden>
+                    {index + 1}.
+                  </span>
+                  <input
+                    type="radio"
+                    name={`schedule-type-${message.id}`}
+                    checked={selectedId === item.id}
+                    disabled={!interactive}
+                    onChange={() => interactive && setScheduleTypeSelection(item.id)}
+                  />
+                  <span className="inline-pick-name">{item.name}</span>
+                </label>
+              </li>
+            ))}
+          </ul>
+          {interactive && (
+            <div className="bubble-actions">
+              <button
+                className="btn primary"
+                type="button"
+                disabled={!scheduleTypeSelection}
+                onClick={confirmScheduleTypeSelection}
+              >
+                Confirm selection
+              </button>
+            </div>
+          )}
+        </div>
+      );
+    }
+
+    if (picker.kind === 'students') {
+      const selected = interactive ? studentSelection : picker.selectedIds;
+      return (
+        <div className={`bubble-embed-unified${picker.frozen ? ' bubble-embed-frozen' : ''}`}>
+          {picker.intro.map((para, i) => (
+            <p key={i} className="bubble-text bubble-text-tight">
+              {para}
+            </p>
+          ))}
+          <div className="inline-pick-head" aria-hidden>
+            <span className="inline-pick-head-num">#</span>
+            <span className="inline-pick-head-ch"> </span>
+            <span className="inline-pick-head-name">Student</span>
+            <span className="inline-pick-head-selected">Selected</span>
+          </div>
+          {!picker.frozen && (
+            <label className="inline-pick-row inline-pick-row-numbered inline-pick-row-modules">
+              <span className="inline-pick-number" aria-hidden>
+                0.
+              </span>
+              <input
+                type="checkbox"
+                checked={picker.students.length > 0 && picker.students.every((s) => selected.includes(s.id))}
+                disabled={!interactive}
+                onChange={() =>
+                  interactive &&
+                  toggleAllIds(
+                    picker.students.map((s) => s.id),
+                    studentSelection,
+                    setStudentSelection,
+                  )
+                }
+              />
+              <span className="inline-pick-name">Select all students</span>
+            </label>
+          )}
+          <ul className="inline-pick-list inline-pick-list-numbered">
+            {picker.students.map((student, index) => {
+              const isSelected = selected.includes(student.id);
+              return (
+                <li key={student.id}>
+                  <label className="inline-pick-row inline-pick-row-numbered inline-pick-row-modules">
+                    <span className="inline-pick-number" aria-hidden>
+                      {index + 1}.
+                    </span>
+                    <input
+                      type="checkbox"
+                      checked={isSelected}
+                      disabled={!interactive}
+                      onChange={() => interactive && toggleId(student.id, studentSelection, setStudentSelection)}
+                    />
+                    <span className="inline-pick-name">{student.fullName}</span>
+                    <span className="inline-pick-selected-cell">
+                      {isSelected ? (
+                        <span className="inline-pick-selected-yes">Yes</span>
+                      ) : (
+                        <span className="inline-pick-selected-dash">â€”</span>
+                      )}
+                    </span>
+                  </label>
+                </li>
+              );
+            })}
+          </ul>
+          {interactive && (
+            <div className="bubble-actions">
+              <button
+                className="btn primary"
+                type="button"
+                disabled={studentSelection.length === 0}
+                onClick={confirmStudentSelection}
+              >
+                Confirm selection
+              </button>
+            </div>
+          )}
+        </div>
+      );
+    }
+
+    if (picker.kind === 'modules') {
+      const selected = interactive ? moduleSelection : picker.selectedIds;
+      return (
+        <div className={`bubble-embed-unified${picker.frozen ? ' bubble-embed-frozen' : ''}`}>
+          {picker.intro.map((para, i) => (
+            <p key={i} className="bubble-text bubble-text-tight">
+              {para}
+            </p>
+          ))}
+          <div className="inline-pick-head" aria-hidden>
+            <span className="inline-pick-head-num">#</span>
+            <span className="inline-pick-head-ch"> </span>
+            <span className="inline-pick-head-name">{picker.contentLabel}</span>
+            <span className="inline-pick-head-selected">Selected</span>
+          </div>
+          {interactive && (
+            <label className="inline-pick-row inline-pick-row-numbered inline-pick-row-modules">
+              <span className="inline-pick-number" aria-hidden>
+                0.
+              </span>
+              <input
+                type="checkbox"
+                checked={picker.modules.length > 0 && picker.modules.every((m) => selected.includes(m.id))}
+                onChange={() =>
+                  toggleAllIds(
+                    picker.modules.map((m) => m.id),
+                    moduleSelection,
+                    setModuleSelection,
+                  )
+                }
+              />
+              <span className="inline-pick-name">Select all</span>
+            </label>
+          )}
+          <ul className="inline-pick-list inline-pick-list-numbered">
+            {picker.modules.map((moduleItem, index) => {
+              const isSelected = selected.includes(moduleItem.id);
+              return (
+                <li key={moduleItem.id}>
+                  <label className="inline-pick-row inline-pick-row-numbered inline-pick-row-modules">
+                    <span className="inline-pick-number" aria-hidden>
+                      {index + 1}.
+                    </span>
+                    <input
+                      type="checkbox"
+                      checked={isSelected}
+                      disabled={!interactive}
+                      onChange={() => interactive && toggleId(moduleItem.id, moduleSelection, setModuleSelection)}
+                    />
+                    <span className="inline-pick-name">{moduleItem.name}</span>
+                    <span className="inline-pick-selected-cell">
+                      {isSelected ? (
+                        <span className="inline-pick-selected-yes">Yes</span>
+                      ) : (
+                        <span className="inline-pick-selected-dash">â€”</span>
+                      )}
+                    </span>
+                  </label>
+                </li>
+              );
+            })}
+          </ul>
+          {interactive && (
+            <>
+              <label className="inline-pick-row copy-module-option">
+                <input
+                  type="checkbox"
+                  checked={copyEachModule}
+                  onChange={(event) => setCopyEachModule(event.target.checked)}
+                />
+                <span>Copy module â€” Select if you need a copy module</span>
+              </label>
+              <label className="copy-module-count" htmlFor={`copy-module-count-${message.id}`}>
+                <span>Enter copy module</span>
+                <input
+                  id={`copy-module-count-${message.id}`}
+                  type="number"
+                  inputMode="numeric"
+                  min={1}
+                  step={1}
+                  value={copyModuleCount}
+                  onChange={(event) => {
+                    const raw = event.target.value;
+                    if (raw === '' || /^\d+$/.test(raw)) {
+                      setCopyModuleCount(raw);
+                    }
+                  }}
+                  disabled={!copyEachModule}
+                />
+              </label>
+              <div className="bubble-actions">
+                <button
+                  className="btn primary"
+                  type="button"
+                  disabled={
+                    moduleSelection.length === 0 ||
+                    (copyEachModule && !/^[1-9]\d*$/.test(copyModuleCount))
+                  }
+                  onClick={confirmModuleSelection}
+                >
+                  Confirm selection
+                </button>
+              </div>
+            </>
+          )}
+          {picker.frozen && picker.copyEachModule && (
+            <p className="bubble-text bubble-text-tight bubble-footnote">
+              Copy module: {picker.copyModuleCount} row(s) per module
+            </p>
+          )}
+        </div>
+      );
+    }
+
+    if (picker.kind === 'rotation_range') {
+      const startVal = interactive ? startRotationSelection : picker.start;
+      const endVal = interactive ? endRotationSelection : picker.end;
+      const maxEnd = picker.maxEnd;
+      return (
+        <div className={`bubble-embed-unified${picker.frozen ? ' bubble-embed-frozen' : ''}`}>
+          <p className="bubble-text bubble-text-tight">{picker.intro}</p>
+          <label className="copy-module-count" htmlFor={`start-rotation-${message.id}`}>
+            <span>Start rotation</span>
+            <input
+              id={`start-rotation-${message.id}`}
+              type="number"
+              inputMode="numeric"
+              min={1}
+              max={Math.max(1, maxEnd - 1)}
+              step={1}
+              value={startVal}
+              disabled={!interactive}
+              onChange={(event) => {
+                const raw = event.target.value;
+                if (raw === '' || /^\d+$/.test(raw)) {
+                  setStartRotationSelection(raw);
+                }
+              }}
+            />
+          </label>
+          <label className="copy-module-count" htmlFor={`end-rotation-${message.id}`}>
+            <span>End rotation</span>
+            <input
+              id={`end-rotation-${message.id}`}
+              type="number"
+              inputMode="numeric"
+              min={2}
+              max={maxEnd}
+              step={1}
+              value={endVal}
+              disabled={!interactive}
+              onChange={(event) => {
+                const raw = event.target.value;
+                if (raw === '' || /^\d+$/.test(raw)) {
+                  setEndRotationSelection(raw);
+                }
+              }}
+            />
+          </label>
+          {interactive && (
+            <div className="bubble-actions">
+              <button
+                className="btn primary"
+                type="button"
+                disabled={
+                  !rotationRangeSpanValid(
+                    Number.parseInt(startRotationSelection, 10),
+                    Number.parseInt(endRotationSelection, 10),
+                    maxEnd,
+                  )
+                }
+                onClick={confirmRotationRangeSelection}
+              >
+                Confirm rotation range
+              </button>
+            </div>
+          )}
+        </div>
+      );
+    }
+
+    return null;
+  }
+
   function renderMessageBody(message: ChatMessage) {
-    if (message.role === 'user' && (message.heading || (message.items && message.items.length > 0))) {
+    if (message.role === 'user') {
+      if (message.heading || (message.items && message.items.length > 0)) {
       return (
         <div className="bubble-body">
           {message.heading && <div className="bubble-heading">{message.heading}</div>}
@@ -1016,7 +1646,35 @@ export default function App() {
           {message.text && <p className="bubble-footnote">{message.text}</p>}
         </div>
       );
+      }
+      if (message.text?.trim()) {
+        return <p className="bubble-text">{message.text}</p>;
+      }
+      return null;
     }
+    if (message.picker) {
+      return renderInlinePicker(message);
+    }
+    if (message.schedule) {
+      return (
+        <div className="schedule-in-chat">
+          {message.text && <p className="bubble-text bubble-text-tight">{message.text}</p>}
+          <ScheduleGridTable
+            schedule={message.schedule}
+            scrollable={!message.showSavePrompt}
+            savePrompt={
+              message.showSavePrompt
+                ? {
+                    onNo: handleSaveScheduleNo,
+                    onYes: () => handleSaveScheduleYes(message.schedule!),
+                  }
+                : undefined
+            }
+          />
+        </div>
+      );
+    }
+
     if (message.preformatted && message.text) {
       return <pre className="bubble-text bubble-pre-table">{message.text}</pre>;
     }
@@ -1029,352 +1687,26 @@ export default function App() {
         <h1>AI Rotational Scheduler</h1>
 
         <div ref={chatThreadRef} className="chat-thread" role="log" aria-live="polite">
-          {chatMessages.map((message) => (
-            <div
-              key={message.id}
-              id={`chat-msg-${message.id}`}
-              className={`msg-row ${message.role === 'user' ? 'msg-row-user' : 'msg-row-assistant'}${message.isError ? ' msg-row-error' : ''}`}
-            >
-              <div className="msg-meta">{message.role === 'user' ? 'You' : 'Assistant'}</div>
-              <div className={`bubble ${message.role === 'user' ? 'bubble-user' : 'bubble-assistant'}`}>
-                {renderMessageBody(message)}
-              </div>
-            </div>
-          ))}
-          {response?.step === 'students' && (
-            <div className="msg-row msg-row-assistant">
-              <div className="msg-meta">Assistant</div>
-              <div className="bubble bubble-assistant bubble-embed bubble-embed-unified">
-                {studentPickerIntroText(response.assistantMessage).map((para, i) => (
-                  <p key={i} className="bubble-text bubble-text-tight">
-                    {para}
-                  </p>
-                ))}
-                <div className="inline-pick-head" aria-hidden>
-                  <span className="inline-pick-head-num">#</span>
-                  <span className="inline-pick-head-ch"> </span>
-                  <span className="inline-pick-head-name">Student</span>
-                  <span className="inline-pick-head-selected">Selected</span>
-                </div>
-                <label className="inline-pick-row inline-pick-row-numbered inline-pick-row-modules">
-                  <span className="inline-pick-number" aria-hidden>
-                    0.
-                  </span>
-                  <input
-                    type="checkbox"
-                    checked={
-                      response.students.length > 0 &&
-                      response.students.every((student) => studentSelection.includes(student.id))
-                    }
-                    onChange={() =>
-                      toggleAllIds(
-                        response.students.map((student) => student.id),
-                        studentSelection,
-                        setStudentSelection,
-                      )
-                    }
-                  />
-                  <span className="inline-pick-name">Select all students</span>
-                  <span className="inline-pick-selected-cell">
-                    {response.students.length > 0 &&
-                    response.students.every((student) => studentSelection.includes(student.id)) ? (
-                      <span className="inline-pick-selected-yes" title="All students selected">
-                        Yes
-                      </span>
-                    ) : (
-                      <span className="inline-pick-selected-dash">—</span>
-                    )}
-                  </span>
-                </label>
-                <ul className="inline-pick-list inline-pick-list-numbered" aria-label="Students — tick to include">
-                  {response.students.map((student, index) => {
-                    const selected = studentSelection.includes(student.id);
-                    return (
-                      <li key={student.id}>
-                        <label className="inline-pick-row inline-pick-row-numbered inline-pick-row-modules">
-                          <span className="inline-pick-number" aria-hidden>
-                            {index + 1}.
-                          </span>
-                          <input
-                            type="checkbox"
-                            checked={selected}
-                            onChange={() => toggleId(student.id, studentSelection, setStudentSelection)}
-                          />
-                          <span className="inline-pick-name">{student.fullName}</span>
-                          <span className="inline-pick-selected-cell">
-                            {selected ? (
-                              <span className="inline-pick-selected-yes" title="Currently selected">
-                                Yes
-                              </span>
-                            ) : (
-                              <span className="inline-pick-selected-dash">—</span>
-                            )}
-                          </span>
-                        </label>
-                      </li>
-                    );
-                  })}
-                </ul>
-                <div className="bubble-actions">
-                  <button
-                    className="btn primary"
-                    type="button"
-                    disabled={loading || studentSelection.length === 0}
-                    onClick={confirmStudentSelection}
-                  >
-                    Confirm selection
-                  </button>
+          {chatMessages.map((message) => {
+            const body = renderMessageBody(message);
+            if (!body) {
+              return null;
+            }
+            return (
+              <div
+                key={message.id}
+                id={`chat-msg-${message.id}`}
+                className={`msg-row ${message.role === 'user' ? 'msg-row-user' : 'msg-row-assistant'}${message.isError ? ' msg-row-error' : ''}`}
+              >
+                <div className="msg-meta">{message.role === 'user' ? 'You' : 'Assistant'}</div>
+                <div
+                  className={`bubble ${message.role === 'user' ? 'bubble-user' : 'bubble-assistant'}${message.schedule ? ' bubble-has-schedule' : ''}${message.picker ? ' bubble-embed' : ''}`}
+                >
+                  {body}
                 </div>
               </div>
-            </div>
-          )}
-          {response && (response.step === 'schedule_types' || response.step === 'modules') && (
-            <div className="msg-row msg-row-assistant">
-              <div className="msg-meta">Assistant</div>
-              <div className="bubble bubble-assistant bubble-embed bubble-embed-unified">
-                {response.step === 'schedule_types'
-                  ? scheduleTypePickerIntroText(response.assistantMessage).map((para, i) => (
-                      <p key={i} className="bubble-text bubble-text-tight">
-                        {para}
-                      </p>
-                    ))
-                  : modulePickerIntroText(
-                      response.assistantMessage,
-                      response.selectedModules?.length ?? 0,
-                      (response.modules?.length ?? 0) > 0,
-                    ).map((para, i) => (
-                      <p key={i} className="bubble-text bubble-text-tight">
-                        {para}
-                      </p>
-                    ))}
-                {response.step === 'schedule_types' && (
-                  <>
-                    <div className="inline-pick-head" aria-hidden>
-                      <span className="inline-pick-head-num">#</span>
-                      <span className="inline-pick-head-ch"> </span>
-                      <span className="inline-pick-head-name">Schedule type</span>
-                    </div>
-                    <ul
-                      className="inline-pick-list inline-pick-list-numbered"
-                      aria-label="Schedule types — pick one"
-                    >
-                      {(response.scheduleTypes ?? []).map((item, index) => (
-                        <li key={item.id}>
-                          <label className="inline-pick-row inline-pick-row-numbered inline-pick-row-modules">
-                            <span className="inline-pick-number" aria-hidden>
-                              {index + 1}.
-                            </span>
-                            <input
-                              type="radio"
-                              name="schedule-type"
-                              checked={scheduleTypeSelection === item.id}
-                              onChange={() => setScheduleTypeSelection(item.id)}
-                            />
-                            <span className="inline-pick-name">{item.name}</span>
-                          </label>
-                        </li>
-                      ))}
-                    </ul>
-                    <div className="bubble-actions">
-                      <button
-                        className="btn primary"
-                        type="button"
-                        disabled={loading || !scheduleTypeSelection}
-                        onClick={confirmScheduleTypeSelection}
-                      >
-                        Confirm selection
-                      </button>
-                    </div>
-                  </>
-                )}
-                {response.step === 'modules' && (
-                  <>
-                    <div className="inline-pick-head" aria-hidden>
-                      <span className="inline-pick-head-num">#</span>
-                      <span className="inline-pick-head-ch"> </span>
-                      <span className="inline-pick-head-name">
-                        {response.selectedScheduleType?.type === 'expedition' ? 'Expedition' : 'Module'}
-                      </span>
-                      <span className="inline-pick-head-selected">Selected</span>
-                    </div>
-                    <label className="inline-pick-row inline-pick-row-numbered inline-pick-row-modules">
-                      <span className="inline-pick-number" aria-hidden>
-                        0.
-                      </span>
-                      <input
-                        type="checkbox"
-                        checked={response.modules.length > 0 && response.modules.every((m) => moduleSelection.includes(m.id))}
-                        onChange={() =>
-                          toggleAllIds(
-                            response.modules.map((m) => m.id),
-                            moduleSelection,
-                            setModuleSelection,
-                          )
-                        }
-                      />
-                      <span className="inline-pick-name">
-                        Select all {response.selectedScheduleType?.type === 'expedition' ? 'expeditions' : 'modules'}
-                      </span>
-                      <span className="inline-pick-selected-cell">
-                        {response.modules.length > 0 && response.modules.every((m) => moduleSelection.includes(m.id)) ? (
-                          <span className="inline-pick-selected-yes" title="All items selected">
-                            Yes
-                          </span>
-                        ) : (
-                          <span className="inline-pick-selected-dash">—</span>
-                        )}
-                      </span>
-                    </label>
-                    <ul className="inline-pick-list inline-pick-list-numbered" aria-label="Items — tick to include">
-                      {response.modules.map((moduleItem, index) => {
-                        const onCurrentSchedule = (response.selectedModules ?? []).some(
-                          (m) => catalogIdFromExpandedModuleRowId(m.id) === moduleItem.id,
-                        );
-                        return (
-                          <li key={moduleItem.id}>
-                            <label className="inline-pick-row inline-pick-row-numbered inline-pick-row-modules">
-                              <span className="inline-pick-number" aria-hidden>
-                                {index + 1}.
-                              </span>
-                              <input
-                                type="checkbox"
-                                checked={moduleSelection.includes(moduleItem.id)}
-                                onChange={() => toggleId(moduleItem.id, moduleSelection, setModuleSelection)}
-                              />
-                              <span className="inline-pick-name">{moduleItem.name}</span>
-                              <span className="inline-pick-selected-cell">
-                                {onCurrentSchedule ? (
-                                  <span className="inline-pick-selected-yes" title="Already on your generated schedule">
-                                    Yes
-                                  </span>
-                                ) : (
-                                  <span className="inline-pick-selected-dash">—</span>
-                                )}
-                              </span>
-                            </label>
-                          </li>
-                        );
-                      })}
-                    </ul>
-                    <label className="inline-pick-row copy-module-option">
-                      <input
-                        type="checkbox"
-                        checked={copyEachModule}
-                        onChange={(event) => setCopyEachModule(event.target.checked)}
-                        disabled={loading}
-                      />
-                      <span>Copy module — Select if you need a copy module</span>
-                    </label>
-                    <label className="copy-module-count" htmlFor="copy-module-count">
-                      <span>Enter copy module</span>
-                      <input
-                        id="copy-module-count"
-                        type="number"
-                        inputMode="numeric"
-                        min={1}
-                        step={1}
-                        value={copyModuleCount}
-                        onChange={(event) => {
-                          const raw = event.target.value;
-                          if (raw === '' || /^\d+$/.test(raw)) {
-                            setCopyModuleCount(raw);
-                          }
-                        }}
-                        disabled={loading || !copyEachModule}
-                      />
-                    </label>
-                    <div className="bubble-actions">
-                      <button
-                        className="btn primary"
-                        type="button"
-                        disabled={
-                          loading ||
-                          moduleSelection.length === 0 ||
-                          (copyEachModule && !/^[1-9]\d*$/.test(copyModuleCount))
-                        }
-                        onClick={confirmModuleSelection}
-                      >
-                        Confirm selection
-                      </button>
-                    </div>
-                  </>
-                )}
-              </div>
-            </div>
-          )}
-          {response?.step === 'rotation_range' && (
-            <div className="msg-row msg-row-assistant">
-              <div className="msg-meta">Assistant</div>
-              <div className="bubble bubble-assistant bubble-embed bubble-embed-unified">
-                <p className="bubble-text bubble-text-tight">
-                  Select the start and end rotation count to update, then confirm.
-                </p>
-                <label className="copy-module-count" htmlFor="start-rotation-range">
-                  <span>Start rotation</span>
-                  <input
-                    id="start-rotation-range"
-                    type="number"
-                    inputMode="numeric"
-                    min={1}
-                    max={Math.max(
-                      1,
-                      (response.rotationRangeMax ?? response.config?.endRotation ?? 2) - 1,
-                    )}
-                    step={1}
-                    value={startRotationSelection}
-                    onChange={(event) => {
-                      const raw = event.target.value;
-                      if (raw === '' || /^\d+$/.test(raw)) {
-                        setStartRotationSelection(raw);
-                      }
-                    }}
-                    disabled={loading}
-                  />
-                </label>
-                <label className="copy-module-count" htmlFor="end-rotation-range">
-                  <span>End rotation</span>
-                  <input
-                    id="end-rotation-range"
-                    type="number"
-                    inputMode="numeric"
-                    min={2}
-                    max={response.rotationRangeMax ?? response.config?.endRotation ?? 99}
-                    step={1}
-                    value={endRotationSelection}
-                    onChange={(event) => {
-                      const raw = event.target.value;
-                      if (raw === '' || /^\d+$/.test(raw)) {
-                        setEndRotationSelection(raw);
-                      }
-                    }}
-                    disabled={loading}
-                  />
-                </label>
-                <div className="bubble-actions">
-                  <button
-                    className="btn primary"
-                    type="button"
-                    disabled={
-                      loading ||
-                      !response ||
-                      (() => {
-                        const finalRot = Math.max(
-                          2,
-                          response.rotationRangeMax ?? response.config?.endRotation ?? 2,
-                        );
-                        const s = Number.parseInt(startRotationSelection, 10);
-                        const e = Number.parseInt(endRotationSelection, 10);
-                        return !rotationRangeValid(s, e, finalRot);
-                      })()
-                    }
-                    onClick={confirmRotationRangeSelection}
-                  >
-                    Confirm rotation range
-                  </button>
-                </div>
-              </div>
-            </div>
-          )}
+            );
+          })}
           {loading && (
             <div className="msg-row msg-row-assistant">
               <div className="msg-meta">Assistant</div>
@@ -1396,12 +1728,12 @@ export default function App() {
                 ? 'Example: create rotational schedule'
                 : chatMode === 'awaiting_class_id'
                   ? 'Enter class ID...'
-                  : 'Reply in natural language (names, numbers, rotations, yes/no)…'
+                  : 'Reply in natural language (names, numbers, rotations, yes/no)â€¦'
             }
             className="input"
           />
           <button disabled={!canSend} type="submit" className="btn">
-            {loading ? 'Sending…' : 'Send'}
+            {loading ? 'Sendingâ€¦' : 'Send'}
           </button>
         </form>
 
@@ -1412,25 +1744,13 @@ export default function App() {
             <section className="step-card">
               <h2 className="step-title">
                 Schedule {index + 1}
-                {entry.classId ? ` — Class ${entry.classId}` : ''}
+                {entry.classId ? ` â€” Class ${entry.classId}` : ''}
               </h2>
-              <ScheduleGridTable schedule={entry.schedule} />
+              <ScheduleGridTable schedule={entry.schedule} scrollable />
             </section>
           </div>
         ))}
 
-        {displaySchedule && (
-          <div ref={schedulePanelRef} className="step-panels schedule-below-chat">
-            <section className="step-card">
-              <h2 className="step-title">
-                {completedSchedules.length > 0
-                  ? `Schedule ${completedSchedules.length + 1}${currentClassId ? ` — Class ${currentClassId}` : ''}`
-                  : 'Generated schedule'}
-              </h2>
-              <ScheduleGridTable schedule={displaySchedule} />
-            </section>
-          </div>
-        )}
       </section>
     </main>
   );
