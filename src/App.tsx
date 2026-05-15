@@ -624,17 +624,25 @@ export default function App() {
     if (!response || response.step !== 'rotation_range') {
       return;
     }
-    const totalRotations = Math.max(
-      1,
-      response.rotationRangeMax ?? response.schedule?.colCount ?? response.config?.endRotation ?? 1,
+    const finalRot = Math.max(
+      2,
+      response.rotationRangeMax ?? response.config?.endRotation ?? response.schedule?.colCount ?? 2,
     );
-    setStartRotationSelection('1');
-    setEndRotationSelection(String(Math.min(totalRotations, 2)));
+    let curStart = response.config?.startRotation ?? 1;
+    let curEnd = response.config?.endRotation ?? finalRot;
+    if (curStart < 1 || curStart >= finalRot) {
+      curStart = 1;
+    }
+    if (curEnd <= curStart || curEnd > finalRot) {
+      curEnd = finalRot;
+    }
+    setStartRotationSelection(String(curStart));
+    setEndRotationSelection(String(curEnd));
   }, [
     response?.sessionId,
     response?.step,
     response?.rotationRangeMax,
-    response?.schedule?.colCount,
+    response?.config?.startRotation,
     response?.config?.endRotation,
   ]);
 
@@ -961,18 +969,27 @@ export default function App() {
     await sendMessage(payload);
   }
 
+  function rotationRangeValid(
+    start: number,
+    end: number,
+    finalRot: number,
+  ): boolean {
+    if (!Number.isInteger(start) || !Number.isInteger(end)) return false;
+    if (start < 1 || start >= finalRot) return false;
+    if (end <= start || end > finalRot) return false;
+    return true;
+  }
+
   async function confirmRotationRangeSelection() {
     if (!response || response.step !== 'rotation_range') return;
     if (loading) return;
-    const totalRotations = Math.max(
-      1,
-      response.rotationRangeMax ?? response.schedule?.colCount ?? response.config?.endRotation ?? 1,
+    const finalRot = Math.max(
+      2,
+      response.rotationRangeMax ?? response.config?.endRotation ?? response.schedule?.colCount ?? 2,
     );
     const start = Number.parseInt(startRotationSelection, 10);
     const end = Number.parseInt(endRotationSelection, 10);
-    if (!Number.isInteger(start) || !Number.isInteger(end)) return;
-    if (start < 1 || start >= totalRotations) return;
-    if (end <= start || end > totalRotations) return;
+    if (!rotationRangeValid(start, end, finalRot)) return;
 
     appendMessages([
       {
@@ -1289,14 +1306,9 @@ export default function App() {
             <div className="msg-row msg-row-assistant">
               <div className="msg-meta">Assistant</div>
               <div className="bubble bubble-assistant bubble-embed bubble-embed-unified">
-                {(response.assistantMessage ?? '')
-                  .split(/\n+/)
-                  .filter((line) => line.trim().length > 0)
-                  .map((line, i) => (
-                    <p key={i} className="bubble-text bubble-text-tight">
-                      {line}
-                    </p>
-                  ))}
+                <p className="bubble-text bubble-text-tight">
+                  Select the start and end rotation count to update, then confirm.
+                </p>
                 <label className="copy-module-count" htmlFor="start-rotation-range">
                   <span>Start rotation</span>
                   <input
@@ -1304,6 +1316,10 @@ export default function App() {
                     type="number"
                     inputMode="numeric"
                     min={1}
+                    max={Math.max(
+                      1,
+                      (response.rotationRangeMax ?? response.config?.endRotation ?? 2) - 1,
+                    )}
                     step={1}
                     value={startRotationSelection}
                     onChange={(event) => {
@@ -1321,7 +1337,8 @@ export default function App() {
                     id="end-rotation-range"
                     type="number"
                     inputMode="numeric"
-                    min={1}
+                    min={2}
+                    max={response.rotationRangeMax ?? response.config?.endRotation ?? 99}
                     step={1}
                     value={endRotationSelection}
                     onChange={(event) => {
@@ -1341,15 +1358,13 @@ export default function App() {
                       loading ||
                       !response ||
                       (() => {
-                        const total = Math.max(1, response.schedule?.colCount ?? response.config?.endRotation ?? 1);
-                        const maxFromApi = response.rotationRangeMax;
-                        const totalRotations = Math.max(1, maxFromApi ?? total);
+                        const finalRot = Math.max(
+                          2,
+                          response.rotationRangeMax ?? response.config?.endRotation ?? 2,
+                        );
                         const s = Number.parseInt(startRotationSelection, 10);
                         const e = Number.parseInt(endRotationSelection, 10);
-                        if (!Number.isInteger(s) || !Number.isInteger(e)) return true;
-                        if (s < 1 || s >= totalRotations) return true;
-                        if (e <= s || e > totalRotations) return true;
-                        return false;
+                        return !rotationRangeValid(s, e, finalRot);
                       })()
                     }
                     onClick={confirmRotationRangeSelection}
