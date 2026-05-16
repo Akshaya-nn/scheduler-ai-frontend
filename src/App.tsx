@@ -30,6 +30,7 @@ type ResponseStep =
   | 'students'
   | 'rotation_range'
   | 'rotation_count'
+  | 'assistantMessage'
   | 'plan'
   | 'rotation_capacity'
   | 'pairing'
@@ -96,7 +97,8 @@ function mergePartialAiResponse(prev: ApiResponse | null, incoming: Record<strin
     sessionId: (i.sessionId ?? prev?.sessionId ?? '') as string,
     step: (i.step ?? prev?.step ?? 'generic') as ApiResponse['step'],
     assistantMessage: (i.assistantMessage ?? prev?.assistantMessage ?? '') as string,
-    rotationRangeMax: i.rotationRangeMax !== undefined ? i.rotationRangeMax : prev?.rotationRangeMax,
+    rotationRangeMax:
+      i.rotationRangeMax !== undefined ? i.rotationRangeMax : undefined,
     students,
     modules,
     scheduleTypes: i.scheduleTypes !== undefined ? i.scheduleTypes : prev?.scheduleTypes,
@@ -337,6 +339,16 @@ function modulePickerIntroText(
   return lines;
 }
 
+/** API sends `rotationRangeMax` only while the user is editing start/end rotations. */
+function isRotationRangeEditResponse(data: ApiResponse): boolean {
+  return typeof data.rotationRangeMax === 'number' && data.rotationRangeMax >= 2;
+}
+
+function rotationRangePickerIntroText(assistantMessage: string): string {
+  const stripped = (assistantMessage ?? '').trim();
+  return stripped || 'Select the start and end rotation count to update, then confirm.';
+}
+
 function assistantMessageLooksLikeError(text: string): boolean {
   const t = text.trim();
   if (!t) return false;
@@ -430,18 +442,15 @@ function buildAssistantChatEntriesFromResponse(data: ApiResponse): Omit<ChatMess
     ];
   }
 
-  if (step === 'rotation_range') {
-    const maxEnd = Math.max(
-      2,
-      data.rotationRangeMax ?? data.config?.endRotation ?? data.schedule?.colCount ?? 2,
-    );
+  if (isRotationRangeEditResponse(data)) {
+    const maxEnd = Math.max(2, data.rotationRangeMax!);
     return [
       {
         role: 'assistant',
         picker: {
           kind: 'rotation_range',
           frozen: false,
-          intro: 'Select the start and end rotation count to update, then confirm.',
+          intro: rotationRangePickerIntroText(raw),
           start: String(data.config?.startRotation ?? 1),
           end: String(data.config?.endRotation ?? maxEnd),
           maxEnd,
@@ -1086,13 +1095,10 @@ export default function App() {
   }, [response?.sessionId, response?.step, scheduleTypesSig, hasContentList]);
 
   useEffect(() => {
-    if (!response || response.step !== 'rotation_range') {
+    if (!response || !isRotationRangeEditResponse(response)) {
       return;
     }
-    const maxEnd = Math.max(
-      2,
-      response.rotationRangeMax ?? response.config?.endRotation ?? response.schedule?.colCount ?? 2,
-    );
+    const maxEnd = Math.max(2, response.rotationRangeMax!);
     const curStart = response.config?.startRotation ?? 1;
     const curEnd = response.config?.endRotation ?? maxEnd;
     setStartRotationSelection(String(Math.min(Math.max(1, curStart), maxEnd - 1)));
@@ -1113,7 +1119,7 @@ export default function App() {
     response?.step === 'modules' ||
     response?.step === 'schedule_types' ||
     response?.step === 'students' ||
-    response?.step === 'rotation_range'
+    (response != null && isRotationRangeEditResponse(response))
       ? persistedSchedule
       : null);
 
@@ -1402,12 +1408,9 @@ export default function App() {
   }
 
   async function confirmRotationRangeSelection() {
-    if (!response || response.step !== 'rotation_range') return;
+    if (!response || !isRotationRangeEditResponse(response)) return;
     if (loading) return;
-    const maxEnd = Math.max(
-      2,
-      response.rotationRangeMax ?? response.config?.endRotation ?? response.schedule?.colCount ?? 2,
-    );
+    const maxEnd = Math.max(2, response.rotationRangeMax!);
     const start = Number.parseInt(startRotationSelection, 10);
     const end = Number.parseInt(endRotationSelection, 10);
     if (!rotationRangeSpanValid(start, end, maxEnd)) return;
@@ -1440,7 +1443,7 @@ export default function App() {
     if (step === 'schedule_types') return 'schedule_types';
     if (step === 'modules') return 'modules';
     if (step === 'students') return 'students';
-    if (step === 'rotation_range') return 'rotation_range';
+    if (response && isRotationRangeEditResponse(response)) return 'rotation_range';
     return null;
   }
 
@@ -1858,13 +1861,13 @@ export default function App() {
           <input
             value={chatInput}
             onChange={(event) => setChatInput(event.target.value)}
-            placeholder={
-              chatMode === 'awaiting_intent'
-                ? 'Example: create rotational schedule'
-                : chatMode === 'awaiting_class_id'
-                  ? 'Enter class ID...'
-                  : 'Reply in natural language (names, numbers, rotations, yes/no)¦'
-            }
+            // placeholder={
+            //   chatMode === 'awaiting_intent'
+            //     ? 'Example: create rotational schedule'
+            //     : chatMode === 'awaiting_class_id'
+            //       ? 'Enter class ID...'
+            //       : 'Reply in natural language (names, numbers, rotations, yes/no)¦'
+            // }
             className="input"
           />
           <button disabled={!canSend} type="submit" className="btn">
