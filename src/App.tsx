@@ -1,4 +1,4 @@
-import { FormEvent, Fragment, useCallback, useEffect, useRef, useState } from 'react';
+import { FormEvent, Fragment, useCallback, useEffect, useLayoutEffect, useRef, useState } from 'react';
 import { createPortal } from 'react-dom';
 
 function toggleId(id: string, list: string[], setter: (next: string[]) => void) {
@@ -548,6 +548,11 @@ function scheduleRotationColumnCount(schedule: NonNullable<ApiResponse['schedule
 /** Render primary module row followed immediately by its copy rows. */
 function scheduleRowDisplayOrder(schedule: NonNullable<ApiResponse['schedule']>): number[] {
   const rows = schedule.rowData ?? [];
+  const seatRows = schedule.seats ?? [];
+  if (rows.length === 0 && seatRows.length > 0) {
+    return seatRows.map((_, i) => i);
+  }
+
   const primaryOrder: string[] = [];
   const byPrimary = new Map<string, number[]>();
   const fallbackPrimaryKey = (index: number) => `__row_${index}`;
@@ -569,6 +574,9 @@ function scheduleRowDisplayOrder(schedule: NonNullable<ApiResponse['schedule']>)
     const primary = indices.filter((idx) => !/::__copy_\d+(?:_\d+)?$/i.test(rows[idx]?.id ?? ''));
     const copies = indices.filter((idx) => /::__copy_\d+(?:_\d+)?$/i.test(rows[idx]?.id ?? ''));
     out.push(...primary, ...copies);
+  }
+  if (out.length === 0 && seatRows.length > 0) {
+    return seatRows.map((_, i) => i);
   }
   return out;
 }
@@ -647,6 +655,53 @@ function ScheduleGridTable({
   const orderedRows = scheduleRowDisplayOrder(schedule);
   const useScroll = scrollable || Boolean(savePrompt);
   const [expanded, setExpanded] = useState(false);
+  const modalBodyRef = useRef<HTMLDivElement>(null);
+  const measureRef = useRef<HTMLDivElement>(null);
+  const [modalFit, setModalFit] = useState({ scaleX: 1, scaleY: 1, nw: 0, nh: 0 });
+
+  useLayoutEffect(() => {
+    if (!expanded) {
+      setModalFit({ scaleX: 1, scaleY: 1, nw: 0, nh: 0 });
+      return;
+    }
+    const body = modalBodyRef.current;
+    const measure = measureRef.current;
+    if (!body || !measure) {
+      return;
+    }
+
+    const compute = () => {
+      const nw = measure.scrollWidth;
+      const nh = measure.scrollHeight;
+      const bw = body.clientWidth;
+      const bh = body.clientHeight;
+      if (nw < 1 || nh < 1 || bw < 1 || bh < 1) {
+        return;
+      }
+      const pad = 8;
+      /** Fill full screen: scale width and height independently (may upscale past 1). */
+      const scaleX = (bw - pad) / nw;
+      const scaleY = (bh - pad) / nh;
+      setModalFit({
+        scaleX: Math.max(scaleX, 0.12),
+        scaleY: Math.max(scaleY, 0.12),
+        nw,
+        nh,
+      });
+    };
+
+    compute();
+    const ro = new ResizeObserver(() => {
+      requestAnimationFrame(compute);
+    });
+    ro.observe(body);
+    ro.observe(measure);
+    const id = requestAnimationFrame(() => requestAnimationFrame(compute));
+    return () => {
+      cancelAnimationFrame(id);
+      ro.disconnect();
+    };
+  }, [expanded, schedule, rotationCols, orderedRows.length]);
 
   useEffect(() => {
     if (!expanded) {
@@ -723,8 +778,19 @@ function ScheduleGridTable({
               Close
             </button>
           </header>
-          <div className="schedule-max-body">
-            <div className="schedule-table-wrap schedule-max-modal-table">{table}</div>
+          <div ref={modalBodyRef} className="schedule-max-body">
+            <div
+              ref={measureRef}
+              className="schedule-max-fit-inner"
+              style={{
+                width: modalFit.nw > 0 ? modalFit.nw : undefined,
+                height: modalFit.nh > 0 ? modalFit.nh : undefined,
+                transform: `scale(${modalFit.scaleX}, ${modalFit.scaleY})`,
+                transformOrigin: 'top left',
+              }}
+            >
+              <div className="schedule-table-wrap schedule-max-modal-table">{table}</div>
+            </div>
           </div>
         </div>
       </div>,
@@ -1702,27 +1768,24 @@ export default function App() {
   function renderMessageBody(message: ChatMessage) {
     if (message.role === 'user') {
       if (message.heading || (message.items && message.items.length > 0)) {
-      return (
-        <div className="bubble-body">
-          {message.heading && <div className="bubble-heading">{message.heading}</div>}
-          {message.items && message.items.length > 0 && (
-            <ol className="bubble-list">
-              {message.items.map((line, index) => (
-                <li key={index}>{line}</li>
-              ))}
-            </ol>
-          )}
-          {message.text && <p className="bubble-footnote">{message.text}</p>}
-        </div>
-      );
+        return (
+          <div className="bubble-body">
+            {message.heading && <div className="bubble-heading">{message.heading}</div>}
+            {message.items && message.items.length > 0 && (
+              <ol className="bubble-list">
+                {message.items.map((line, index) => (
+                  <li key={index}>{line}</li>
+                ))}
+              </ol>
+            )}
+            {message.text && <p className="bubble-footnote">{message.text}</p>}
+          </div>
+        );
       }
       if (message.text?.trim()) {
         return <p className="bubble-text">{message.text}</p>;
       }
       return null;
-    }
-    if (message.picker) {
-      return renderInlinePicker(message);
     }
     if (message.schedule) {
       return (
@@ -1742,6 +1805,9 @@ export default function App() {
           />
         </div>
       );
+    }
+    if (message.picker) {
+      return renderInlinePicker(message);
     }
 
     if (message.preformatted && message.text) {

@@ -425,15 +425,18 @@ body { margin: 0; -webkit-font-smoothing: antialiased; }
   outline-offset: 2px;
 }
 
-/* Full-screen expanded schedule (modal) */
+/* Full-screen expanded schedule (modal) — fills viewport */
 .schedule-max-overlay {
   position: fixed;
   inset: 0;
   z-index: 9999;
   display: flex;
-  align-items: center;
-  justify-content: center;
-  padding: clamp(12px, 3vw, 28px);
+  flex-direction: column;
+  padding: 0;
+  margin: 0;
+  width: 100vw;
+  height: 100vh;
+  height: 100dvh;
 }
 
 .schedule-max-backdrop {
@@ -443,22 +446,23 @@ body { margin: 0; -webkit-font-smoothing: antialiased; }
   padding: 0;
   border: none;
   cursor: pointer;
-  background: rgba(6, 8, 14, 0.72);
-  backdrop-filter: blur(6px);
+  background: rgba(6, 8, 14, 0.85);
+  backdrop-filter: blur(8px);
 }
 
 .schedule-max-shell {
   position: relative;
   z-index: 1;
+  flex: 1;
   display: flex;
   flex-direction: column;
-  width: min(96vw, 1320px);
-  height: min(92vh, 900px);
-  max-height: 92vh;
-  border-radius: 16px;
-  border: 1px solid var(--grey-70);
+  width: 100%;
+  min-height: 0;
+  max-height: none;
+  border-radius: 0;
+  border: none;
   background: var(--surface-card);
-  box-shadow: var(--shadow-lg), var(--shadow-blue);
+  box-shadow: none;
   overflow: hidden;
 }
 
@@ -468,7 +472,7 @@ body { margin: 0; -webkit-font-smoothing: antialiased; }
   justify-content: space-between;
   gap: 16px;
   flex-shrink: 0;
-  padding: 14px 18px;
+  padding: 10px 16px;
   background: linear-gradient(135deg, var(--ink-80) 0%, var(--surface-inset) 100%);
   border-bottom: 1px solid var(--grey-70);
 }
@@ -491,9 +495,16 @@ body { margin: 0; -webkit-font-smoothing: antialiased; }
 .schedule-max-body {
   flex: 1;
   min-height: 0;
-  padding: 14px 16px 18px;
-  overflow: auto;
+  display: block;
+  padding: 8px;
+  overflow: hidden;
   background: var(--surface-inset);
+}
+
+.schedule-max-fit-inner {
+  width: max-content;
+  max-width: none;
+  transform-origin: top left;
 }
 
 .schedule-max-modal-table {
@@ -504,23 +515,12 @@ body { margin: 0; -webkit-font-smoothing: antialiased; }
 }
 
 .schedule-max-modal-table.schedule-table-wrap {
-  overflow-x: auto;
-  overflow-y: visible;
+  overflow: visible;
 }
 
 .schedule-max-modal-table .schedule-table {
   width: max-content;
-  min-width: min(100%, 720px);
-}
-
-.schedule-max-body::-webkit-scrollbar {
-  width: 8px;
-  height: 8px;
-}
-
-.schedule-max-body::-webkit-scrollbar-thumb {
-  background: var(--grey-70);
-  border-radius: 999px;
+  min-width: 100%;
 }
 
 .schedule-card .schedule-table-wrap {
