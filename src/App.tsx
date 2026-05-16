@@ -1,4 +1,5 @@
 import { FormEvent, Fragment, useCallback, useEffect, useRef, useState } from 'react';
+import { createPortal } from 'react-dom';
 
 function toggleId(id: string, list: string[], setter: (next: string[]) => void) {
   if (list.includes(id)) {
@@ -22,7 +23,7 @@ type ModuleItem = { id: string; name: string };
 type ScheduleTypeItem = { id: string; name: string; type: string };
 type SeatCell = { 0: { id: string; fullName: string }; 1: { id: string; fullName: string } };
 
-/** Public API `step` â€” what the client should show next (matches server `SelectionStep`). */
+/** Public API `step` ” what the client should show next (matches server `SelectionStep`). */
 type ResponseStep =
   | 'schedule_types'
   | 'modules'
@@ -160,7 +161,7 @@ type ChatMessage = {
   /** Frozen schedule grid shown inside the chat bubble */
   schedule?: NonNullable<ApiResponse['schedule']>;
   showSavePrompt?: boolean;
-  /** Inline checklist / picker (single assistant bubble â€” no duplicate text above) */
+  /** Inline checklist / picker (single assistant bubble ” no duplicate text above) */
   picker?: ChatPicker;
 };
 
@@ -308,7 +309,7 @@ function modulePickerIntroText(
   const lines: string[] = [];
   if (!looksLikeScheduleTypePrompt && preselectedModuleCount > 0) {
     lines.push(
-      `${preselectedModuleCount} item${preselectedModuleCount === 1 ? '' : 's'} marked Selected are already on your current scheduleâ€”keep them checked to retain them, tick more to add, then confirm.`,
+      `${preselectedModuleCount} item${preselectedModuleCount === 1 ? '' : 's'} marked Selected are already on your current schedule”keep them checked to retain them, tick more to add, then confirm.`,
     );
   }
   if (stripped) {
@@ -450,11 +451,11 @@ function buildAssistantChatEntriesFromResponse(data: ApiResponse): Omit<ChatMess
   }
 
   if (step === 'plan') {
-    return raw ? [{ role: 'assistant', text: raw }] : [{ role: 'assistant', text: 'â€¦' }];
+    return raw ? [{ role: 'assistant', text: raw }] : [{ role: 'assistant', text: '¦' }];
   }
 
   if (!raw) {
-    return [{ role: 'assistant', text: 'â€¦' }];
+    return [{ role: 'assistant', text: '¦' }];
   }
   if (raw.includes('| --- |')) {
     return [{ role: 'assistant', text: raw, preformatted: true }];
@@ -634,14 +635,36 @@ function ScheduleGridTable({
   schedule,
   scrollable = false,
   savePrompt,
+  showExpandControl = true,
 }: {
   schedule: NonNullable<ApiResponse['schedule']>;
   scrollable?: boolean;
   savePrompt?: { onYes: () => void; onNo: () => void };
+  /** Inline compact view only — full-screen expand affordance */
+  showExpandControl?: boolean;
 }) {
   const rotationCols = scheduleRotationColumnCount(schedule);
   const orderedRows = scheduleRowDisplayOrder(schedule);
   const useScroll = scrollable || Boolean(savePrompt);
+  const [expanded, setExpanded] = useState(false);
+
+  useEffect(() => {
+    if (!expanded) {
+      return;
+    }
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') {
+        setExpanded(false);
+      }
+    };
+    document.addEventListener('keydown', onKey);
+    const prevOverflow = document.body.style.overflow;
+    document.body.style.overflow = 'hidden';
+    return () => {
+      document.removeEventListener('keydown', onKey);
+      document.body.style.overflow = prevOverflow;
+    };
+  }, [expanded]);
 
   const table = (
     <table className="schedule-table">
@@ -680,27 +703,73 @@ function ScheduleGridTable({
     </table>
   );
 
+  const expandModal =
+    expanded &&
+    typeof document !== 'undefined' &&
+    createPortal(
+      <div className="schedule-max-overlay" role="dialog" aria-modal="true" aria-labelledby="schedule-max-heading">
+        <button
+          type="button"
+          className="schedule-max-backdrop"
+          aria-label="Close expanded schedule"
+          onClick={() => setExpanded(false)}
+        />
+        <div className="schedule-max-shell">
+          <header className="schedule-max-header">
+            <h2 id="schedule-max-heading" className="schedule-max-title">
+              Schedule overview
+            </h2>
+            <button type="button" className="schedule-max-close btn btn-outline" onClick={() => setExpanded(false)}>
+              Close
+            </button>
+          </header>
+          <div className="schedule-max-body">
+            <div className="schedule-table-wrap schedule-max-modal-table">{table}</div>
+          </div>
+        </div>
+      </div>,
+      document.body,
+    );
+
+  const compactToolbar =
+    useScroll && showExpandControl ? (
+      <div className="schedule-compact-toolbar">
+        <span className="schedule-compact-hint">Scroll to explore the grid</span>
+        <button type="button" className="btn-schedule-expand" onClick={() => setExpanded(true)}>
+          Expand full table
+        </button>
+      </div>
+    ) : null;
+
   if (!savePrompt) {
     return (
-      <div className={`schedule-table-wrap${useScroll ? ' schedule-table-wrap--scroll' : ''}`}>{table}</div>
+      <>
+        {compactToolbar}
+        <div className={`schedule-table-wrap${useScroll ? ' schedule-table-wrap--scroll' : ''}`}>{table}</div>
+        {expandModal}
+      </>
     );
   }
 
   return (
-    <div className="schedule-card">
-      <div className="schedule-table-wrap schedule-table-wrap--scroll">{table}</div>
-      <footer className="schedule-save-prompt">
-        <p className="schedule-save-prompt-text">Would you like to save this schedule?</p>
-        <div className="schedule-save-actions">
-          <button className="btn btn-outline" type="button" onClick={savePrompt.onNo}>
-            No
-          </button>
-          <button className="btn primary" type="button" onClick={savePrompt.onYes}>
-            Yes, save
-          </button>
-        </div>
-      </footer>
-    </div>
+    <>
+      <div className="schedule-card">
+        {compactToolbar}
+        <div className="schedule-table-wrap schedule-table-wrap--scroll">{table}</div>
+        <footer className="schedule-save-prompt">
+          <p className="schedule-save-prompt-text">Would you like to save this schedule?</p>
+          <div className="schedule-save-actions">
+            <button className="btn btn-outline" type="button" onClick={savePrompt.onNo}>
+              No
+            </button>
+            <button className="btn primary" type="button" onClick={savePrompt.onYes}>
+              Yes, save
+            </button>
+          </div>
+        </footer>
+      </div>
+      {expandModal}
+    </>
   );
 }
 
@@ -740,7 +809,7 @@ export default function App() {
   const chatThreadRef = useRef<HTMLDivElement>(null);
   /** Skip duplicate schedule cards in chat when the grid unchanged. */
   const lastChatScheduleFingerprintRef = useRef<string | null>(null);
-  /** True once the user has reached `completed` with a grid â€” used to skip chat auto-scroll during module-edit interrupts. */
+  /** True once the user has reached `completed` with a grid ” used to skip chat auto-scroll during module-edit interrupts. */
   const completedScheduleEverRef = useRef(false);
   /** Avoid double `scrollIntoView` in React Strict Mode for the same bubble. */
   const moduleCapacityScrollDoneForMessageIdRef = useRef<string | null>(null);
@@ -1127,7 +1196,7 @@ export default function App() {
     appendMessages([
       {
         role: 'assistant',
-        text: "Sure â€” let's create another rotational schedule. Please provide the new class ID.",
+        text: "Sure ” let's create another rotational schedule. Please provide the new class ID.",
       },
     ]);
     return true;
@@ -1160,7 +1229,7 @@ export default function App() {
       if (chatMode === 'awaiting_intent') {
         /**
          * Accept a bare Mongo ObjectId (or message that contains one) before
-         * requiring rotational phrasing â€” matches "paste class ID only" UX.
+         * requiring rotational phrasing ” matches "paste class ID only" UX.
          */
         const inlineClassIdEarly = extractClassIdFromMessage(message);
         if (inlineClassIdEarly) {
@@ -1298,7 +1367,7 @@ export default function App() {
   }
 
   function handleSaveScheduleNo() {
-    appendMessages([{ role: 'assistant', text: 'OK â€” tell me if you want any other changes.' }]);
+    appendMessages([{ role: 'assistant', text: 'OK ” tell me if you want any other changes.' }]);
   }
 
   function stepToPickerKind(step: ResponseStep | undefined): ChatPicker['kind'] | null {
@@ -1422,7 +1491,7 @@ export default function App() {
                       {isSelected ? (
                         <span className="inline-pick-selected-yes">Yes</span>
                       ) : (
-                        <span className="inline-pick-selected-dash">â€”</span>
+                        <span className="inline-pick-selected-dash">”</span>
                       )}
                     </span>
                   </label>
@@ -1500,7 +1569,7 @@ export default function App() {
                       {isSelected ? (
                         <span className="inline-pick-selected-yes">Yes</span>
                       ) : (
-                        <span className="inline-pick-selected-dash">â€”</span>
+                        <span className="inline-pick-selected-dash">”</span>
                       )}
                     </span>
                   </label>
@@ -1516,7 +1585,7 @@ export default function App() {
                   checked={copyEachModule}
                   onChange={(event) => setCopyEachModule(event.target.checked)}
                 />
-                <span>Copy module â€” Select if you need a copy module</span>
+                <span>Copy module ” Select if you need a copy module</span>
               </label>
               <label className="copy-module-count" htmlFor={`copy-module-count-${message.id}`}>
                 <span>Enter copy module</span>
@@ -1728,12 +1797,12 @@ export default function App() {
                 ? 'Example: create rotational schedule'
                 : chatMode === 'awaiting_class_id'
                   ? 'Enter class ID...'
-                  : 'Reply in natural language (names, numbers, rotations, yes/no)â€¦'
+                  : 'Reply in natural language (names, numbers, rotations, yes/no)¦'
             }
             className="input"
           />
           <button disabled={!canSend} type="submit" className="btn">
-            {loading ? 'Sendingâ€¦' : 'Send'}
+            {loading ? 'Sending¦' : 'Send'}
           </button>
         </form>
 
@@ -1744,7 +1813,7 @@ export default function App() {
             <section className="step-card">
               <h2 className="step-title">
                 Schedule {index + 1}
-                {entry.classId ? ` â€” Class ${entry.classId}` : ''}
+                {entry.classId ? `  Class ${entry.classId}` : ''}
               </h2>
               <ScheduleGridTable schedule={entry.schedule} scrollable />
             </section>
