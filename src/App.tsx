@@ -1,4 +1,4 @@
-import { FormEvent, Fragment, useCallback, useEffect, useLayoutEffect, useRef, useState } from 'react';
+import { FormEvent, Fragment, useCallback, useEffect, useRef, useState } from 'react';
 import { createPortal } from 'react-dom';
 
 function toggleId(id: string, list: string[], setter: (next: string[]) => void) {
@@ -31,7 +31,6 @@ type ResponseStep =
   | 'rotation_range'
   | 'rotation_count'
   | 'assistantMessage'
-  | 'plan'
   | 'rotation_capacity'
   | 'pairing'
   | 'schedule'
@@ -459,18 +458,11 @@ function buildAssistantChatEntriesFromResponse(data: ApiResponse): Omit<ChatMess
     ];
   }
 
-  if (step === 'plan') {
-    return raw ? [{ role: 'assistant', text: raw }] : [{ role: 'assistant', text: '¦' }];
-  }
-
   if (!raw) {
     return [{ role: 'assistant', text: '¦' }];
   }
   if (raw.includes('| --- |')) {
     return [{ role: 'assistant', text: raw, preformatted: true }];
-  }
-  if (/^Here's the plan based on your selection:/i.test(raw)) {
-    return [{ role: 'assistant', text: raw }];
   }
   const parts = raw
     .split(/\n{2,}/)
@@ -664,53 +656,6 @@ function ScheduleGridTable({
   const orderedRows = scheduleRowDisplayOrder(schedule);
   const useScroll = scrollable || Boolean(savePrompt);
   const [expanded, setExpanded] = useState(false);
-  const modalBodyRef = useRef<HTMLDivElement>(null);
-  const measureRef = useRef<HTMLDivElement>(null);
-  const [modalFit, setModalFit] = useState({ scaleX: 1, scaleY: 1, nw: 0, nh: 0 });
-
-  useLayoutEffect(() => {
-    if (!expanded) {
-      setModalFit({ scaleX: 1, scaleY: 1, nw: 0, nh: 0 });
-      return;
-    }
-    const body = modalBodyRef.current;
-    const measure = measureRef.current;
-    if (!body || !measure) {
-      return;
-    }
-
-    const compute = () => {
-      const nw = measure.scrollWidth;
-      const nh = measure.scrollHeight;
-      const bw = body.clientWidth;
-      const bh = body.clientHeight;
-      if (nw < 1 || nh < 1 || bw < 1 || bh < 1) {
-        return;
-      }
-      const pad = 8;
-      /** Fill full screen: scale width and height independently (may upscale past 1). */
-      const scaleX = (bw - pad) / nw;
-      const scaleY = (bh - pad) / nh;
-      setModalFit({
-        scaleX: Math.max(scaleX, 0.12),
-        scaleY: Math.max(scaleY, 0.12),
-        nw,
-        nh,
-      });
-    };
-
-    compute();
-    const ro = new ResizeObserver(() => {
-      requestAnimationFrame(compute);
-    });
-    ro.observe(body);
-    ro.observe(measure);
-    const id = requestAnimationFrame(() => requestAnimationFrame(compute));
-    return () => {
-      cancelAnimationFrame(id);
-      ro.disconnect();
-    };
-  }, [expanded, schedule, rotationCols, orderedRows.length]);
 
   useEffect(() => {
     if (!expanded) {
@@ -787,19 +732,8 @@ function ScheduleGridTable({
               Close
             </button>
           </header>
-          <div ref={modalBodyRef} className="schedule-max-body">
-            <div
-              ref={measureRef}
-              className="schedule-max-fit-inner"
-              style={{
-                width: modalFit.nw > 0 ? modalFit.nw : undefined,
-                height: modalFit.nh > 0 ? modalFit.nh : undefined,
-                transform: `scale(${modalFit.scaleX}, ${modalFit.scaleY})`,
-                transformOrigin: 'top left',
-              }}
-            >
-              <div className="schedule-table-wrap schedule-max-modal-table">{table}</div>
-            </div>
+          <div className="schedule-max-body">
+            <div className="schedule-table-wrap schedule-max-modal-table schedule-table-wrap--scroll">{table}</div>
           </div>
         </div>
       </div>,
