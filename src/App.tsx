@@ -85,11 +85,20 @@ function mergePartialAiResponse(prev: ApiResponse | null, incoming: Record<strin
     modules = [];
   }
   const scheduleTypeListActive = step === 'schedule_types';
+  const incomingHasSchedule = i.schedule !== undefined && i.schedule !== null;
   const selectedModules = i.selectedModules !== undefined
     ? i.selectedModules
     : scheduleTypeListActive
       ? []
-      : (prev?.selectedModules ?? []);
+      : incomingHasSchedule && (prev?.selectedModules?.length ?? 0) > 0
+        ? prev!.selectedModules!
+        : (prev?.selectedModules ?? []);
+  const selectedStudents =
+    i.selectedStudents !== undefined
+      ? i.selectedStudents
+      : incomingHasSchedule && (prev?.selectedStudents?.length ?? 0) > 0
+        ? prev!.selectedStudents!
+        : (prev?.selectedStudents ?? students);
   return {
     statusCode: i.statusCode ?? prev?.statusCode,
     success: i.success ?? prev?.success,
@@ -103,8 +112,7 @@ function mergePartialAiResponse(prev: ApiResponse | null, incoming: Record<strin
     scheduleTypes: i.scheduleTypes !== undefined ? i.scheduleTypes : prev?.scheduleTypes,
     selectedScheduleType:
       i.selectedScheduleType !== undefined ? i.selectedScheduleType : prev?.selectedScheduleType,
-    selectedStudents:
-      i.selectedStudents !== undefined ? i.selectedStudents : (prev?.selectedStudents ?? students),
+    selectedStudents,
     selectedModules,
     schedule: i.schedule !== undefined ? i.schedule : (prev?.schedule ?? null),
     config: i.config !== undefined ? i.config : prev?.config,
@@ -161,7 +169,6 @@ type ChatMessage = {
   preformatted?: boolean;
   /** Frozen schedule grid shown inside the chat bubble */
   schedule?: NonNullable<ApiResponse['schedule']>;
-  showSavePrompt?: boolean;
   /** Inline checklist / picker (single assistant bubble ” no duplicate text above) */
   picker?: ChatPicker;
 };
@@ -368,8 +375,6 @@ function buildAssistantChatEntriesFromResponse(data: ApiResponse): Omit<ChatMess
         role: 'assistant',
         text: raw || 'Here is your generated schedule.',
         schedule: grid,
-        /** API maps internal `completed` + grid → public step `schedule`; show save footer for both. */
-        showSavePrompt: true,
       },
     ];
   }
@@ -643,18 +648,16 @@ function catalogIdFromExpandedModuleRowId(id: string): string {
 function ScheduleGridTable({
   schedule,
   scrollable = false,
-  savePrompt,
   showExpandControl = true,
 }: {
   schedule: NonNullable<ApiResponse['schedule']>;
   scrollable?: boolean;
-  savePrompt?: { onYes: () => void; onNo: () => void };
   /** Inline compact view only — full-screen expand affordance */
   showExpandControl?: boolean;
 }) {
   const rotationCols = scheduleRotationColumnCount(schedule);
   const orderedRows = scheduleRowDisplayOrder(schedule);
-  const useScroll = scrollable || Boolean(savePrompt);
+  const useScroll = scrollable;
   const [expanded, setExpanded] = useState(false);
 
   useEffect(() => {
@@ -750,33 +753,10 @@ function ScheduleGridTable({
       </div>
     ) : null;
 
-  if (!savePrompt) {
-    return (
-      <>
-        {compactToolbar}
-        <div className={`schedule-table-wrap${useScroll ? ' schedule-table-wrap--scroll' : ''}`}>{table}</div>
-        {expandModal}
-      </>
-    );
-  }
-
   return (
     <>
-      <div className="schedule-card">
-        {compactToolbar}
-        <div className="schedule-table-wrap schedule-table-wrap--scroll">{table}</div>
-        <footer className="schedule-save-prompt">
-          <p className="schedule-save-prompt-text">Would you like to save this schedule?</p>
-          <div className="schedule-save-actions">
-            <button className="btn btn-outline" type="button" onClick={savePrompt.onNo}>
-              No
-            </button>
-            <button className="btn primary" type="button" onClick={savePrompt.onYes}>
-              Yes, save
-            </button>
-          </div>
-        </footer>
-      </div>
+      {compactToolbar}
+      <div className={`schedule-table-wrap${useScroll ? ' schedule-table-wrap--scroll' : ''}`}>{table}</div>
       {expandModal}
     </>
   );
@@ -1356,23 +1336,6 @@ export default function App() {
     await sendMessage(`start rotation exactly ${start} end rotation exactly ${end}`);
   }
 
-  function handleSaveScheduleYes(schedule: NonNullable<ApiResponse['schedule']>) {
-    setCompletedSchedules((prev) => [
-      ...prev,
-      {
-        id: `s-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
-        classId: currentClassId,
-        schedule,
-        generatedAt: Date.now(),
-      },
-    ]);
-    appendMessages([{ role: 'assistant', text: 'Schedule saved.' }]);
-  }
-
-  function handleSaveScheduleNo() {
-    appendMessages([{ role: 'assistant', text: 'OK ” tell me if you want any other changes.' }]);
-  }
-
   function stepToPickerKind(step: ResponseStep | undefined): ChatPicker['kind'] | null {
     if (step === 'schedule_types') return 'schedule_types';
     if (step === 'modules') return 'modules';
@@ -1728,18 +1691,7 @@ export default function App() {
       return (
         <div className="schedule-in-chat">
           {message.text && <p className="bubble-text bubble-text-tight">{message.text}</p>}
-          <ScheduleGridTable
-            schedule={message.schedule}
-            scrollable={!message.showSavePrompt}
-            savePrompt={
-              message.showSavePrompt
-                ? {
-                    onNo: handleSaveScheduleNo,
-                    onYes: () => handleSaveScheduleYes(message.schedule!),
-                  }
-                : undefined
-            }
-          />
+          <ScheduleGridTable schedule={message.schedule} scrollable />
         </div>
       );
     }

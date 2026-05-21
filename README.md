@@ -63,8 +63,6 @@ const apiBase = 'http://localhost:8080/v2';
 
 Change this string if the backend runs elsewhere.
 
----
-
 ## 4. Backend Contract (what the FE talks to)
 
 The frontend consumes **two** POST endpoints:

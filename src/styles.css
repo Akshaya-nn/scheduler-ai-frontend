@@ -534,35 +534,6 @@ body { margin: 0; -webkit-font-smoothing: antialiased; }
   display: none;
 }
 
-.schedule-card .schedule-table-wrap--scroll {
-  max-height: min(320px, 40vh);
-}
-
-.schedule-save-prompt {
-  display: flex;
-  flex-direction: row;
-  align-items: center;
-  justify-content: space-between;
-  gap: 12px;
-  flex-wrap: wrap;
-  margin: 0;
-  padding: 12px 14px;
-  border-top: 1px solid var(--grey-70);
-  background: var(--grey-90);
-}
-
-.schedule-save-prompt-text {
-  margin: 0;
-  font-size: 0.9rem;
-  color: var(--grey-20);
-}
-
-.schedule-save-actions {
-  display: flex;
-  gap: 8px;
-  flex-shrink: 0;
-}
-
 .btn-outline {
   background: transparent;
   border: 1px solid var(--grey-50);
