@@ -1,5 +1,12 @@
 import { FormEvent, Fragment, useCallback, useEffect, useRef, useState } from 'react';
-import { createPortal } from 'react-dom';
+import { ScheduleFullPageRoute } from './ScheduleFullPage';
+import {
+  closeScheduleFullView,
+  isScheduleFullViewPath,
+  migrateLegacyScheduleFullHash,
+  openScheduleFullView,
+  SCHEDULE_VIEW_SYNC_EVENT,
+} from './schedule-full-view';
 
 function toggleId(id: string, list: string[], setter: (next: string[]) => void) {
   if (list.includes(id)) {
@@ -119,7 +126,7 @@ function mergePartialAiResponse(prev: ApiResponse | null, incoming: Record<strin
   };
 }
 
-const apiBase = 'http://localhost:8080/v2';
+const apiBase = import.meta.env.VITE_AI_API_BASE ?? 'http://localhost:8080/v2';
 
 type ChatPicker =
   | {
@@ -169,6 +176,8 @@ type ChatMessage = {
   preformatted?: boolean;
   /** Frozen schedule grid shown inside the chat bubble */
   schedule?: NonNullable<ApiResponse['schedule']>;
+  /** Show Yes/No save footer under the grid in this bubble */
+  showSavePrompt?: boolean;
   /** Inline checklist / picker (single assistant bubble ” no duplicate text above) */
   picker?: ChatPicker;
 };
@@ -375,6 +384,7 @@ function buildAssistantChatEntriesFromResponse(data: ApiResponse): Omit<ChatMess
         role: 'assistant',
         text: raw || 'Here is your generated schedule.',
         schedule: grid,
+        showSavePrompt: true,
       },
     ];
   }
@@ -648,35 +658,24 @@ function catalogIdFromExpandedModuleRowId(id: string): string {
 function ScheduleGridTable({
   schedule,
   scrollable = false,
+  savePrompt,
   showExpandControl = true,
+  expandTitle = 'Schedule overview',
 }: {
   schedule: NonNullable<ApiResponse['schedule']>;
   scrollable?: boolean;
-  /** Inline compact view only — full-screen expand affordance */
+  savePrompt?: { onYes: () => void; onNo: () => void; saving?: boolean };
+  /** Inline compact view only — opens dedicated full-page view (not an overlay). */
   showExpandControl?: boolean;
+  expandTitle?: string;
 }) {
   const rotationCols = scheduleRotationColumnCount(schedule);
   const orderedRows = scheduleRowDisplayOrder(schedule);
-  const useScroll = scrollable;
-  const [expanded, setExpanded] = useState(false);
+  const useScroll = scrollable || Boolean(savePrompt);
 
-  useEffect(() => {
-    if (!expanded) {
-      return;
-    }
-    const onKey = (e: KeyboardEvent) => {
-      if (e.key === 'Escape') {
-        setExpanded(false);
-      }
-    };
-    document.addEventListener('keydown', onKey);
-    const prevOverflow = document.body.style.overflow;
-    document.body.style.overflow = 'hidden';
-    return () => {
-      document.removeEventListener('keydown', onKey);
-      document.body.style.overflow = prevOverflow;
-    };
-  }, [expanded]);
+  const openFullPage = () => {
+    openScheduleFullView({ schedule, title: expandTitle });
+  };
 
   const table = (
     <table className="schedule-table">
@@ -715,61 +714,68 @@ function ScheduleGridTable({
     </table>
   );
 
-  const expandModal =
-    expanded &&
-    typeof document !== 'undefined' &&
-    createPortal(
-      <div className="schedule-max-overlay" role="dialog" aria-modal="true" aria-labelledby="schedule-max-heading">
-        <button
-          type="button"
-          className="schedule-max-backdrop"
-          aria-label="Close expanded schedule"
-          onClick={() => setExpanded(false)}
-        />
-        <div className="schedule-max-shell">
-          <header className="schedule-max-header">
-            <h2 id="schedule-max-heading" className="schedule-max-title">
-              Schedule overview
-            </h2>
-            <button type="button" className="schedule-max-close btn btn-outline" onClick={() => setExpanded(false)}>
-              Close
-            </button>
-          </header>
-          <div className="schedule-max-body">
-            <div className="schedule-table-wrap schedule-max-modal-table schedule-table-wrap--scroll">{table}</div>
-          </div>
-        </div>
-      </div>,
-      document.body,
-    );
-
   const compactToolbar =
     useScroll && showExpandControl ? (
       <div className="schedule-compact-toolbar">
         <span className="schedule-compact-hint">Scroll to explore the grid</span>
-        <button type="button" className="btn-schedule-expand" onClick={() => setExpanded(true)}>
+        <button type="button" className="btn-schedule-expand" onClick={openFullPage}>
           Expand full table
         </button>
       </div>
     ) : null;
 
+  if (!savePrompt) {
+    return (
+      <>
+        {compactToolbar}
+        <div className={`schedule-table-wrap${useScroll ? ' schedule-table-wrap--scroll' : ''}`}>{table}</div>
+      </>
+    );
+  }
+
   return (
-    <>
+    <div className="schedule-card">
       {compactToolbar}
-      <div className={`schedule-table-wrap${useScroll ? ' schedule-table-wrap--scroll' : ''}`}>{table}</div>
-      {expandModal}
-    </>
+      <div className="schedule-table-wrap schedule-table-wrap--scroll">{table}</div>
+      <footer className="schedule-save-prompt">
+        <p className="schedule-save-prompt-text">Would you like to save this schedule?</p>
+        <div className="schedule-save-actions">
+          <button className="btn btn-outline" type="button" disabled={savePrompt.saving} onClick={savePrompt.onNo}>
+            No
+          </button>
+          <button className="btn primary" type="button" disabled={savePrompt.saving} onClick={savePrompt.onYes}>
+            {savePrompt.saving ? 'Saving…' : 'Yes, save'}
+          </button>
+        </div>
+      </footer>
+    </div>
   );
 }
 
 type CompletedScheduleEntry = {
   id: string;
+  sessionId: string;
   classId: string;
   schedule: NonNullable<ApiResponse['schedule']>;
   generatedAt: number;
+  savedScheduleId?: string;
 };
 
 export default function App() {
+  const [scheduleFullView, setScheduleFullView] = useState(() => isScheduleFullViewPath());
+
+  useEffect(() => {
+    migrateLegacyScheduleFullHash();
+    const syncView = () => setScheduleFullView(isScheduleFullViewPath());
+    syncView();
+    window.addEventListener('popstate', syncView);
+    window.addEventListener(SCHEDULE_VIEW_SYNC_EVENT, syncView);
+    return () => {
+      window.removeEventListener('popstate', syncView);
+      window.removeEventListener(SCHEDULE_VIEW_SYNC_EVENT, syncView);
+    };
+  }, []);
+
   const [sessionId, setSessionId] = useState('');
   const [currentClassId, setCurrentClassId] = useState('');
   const [completedSchedules, setCompletedSchedules] = useState<CompletedScheduleEntry[]>([]);
@@ -787,6 +793,8 @@ export default function App() {
   const [startRotationSelection, setStartRotationSelection] = useState('1');
   const [endRotationSelection, setEndRotationSelection] = useState('2');
   const [error, setError] = useState('');
+  const [savingSchedule, setSavingSchedule] = useState(false);
+  const [savedScheduleId, setSavedScheduleId] = useState<string | null>(null);
   const [chatMessages, setChatMessages] = useState<ChatMessage[]>([
     {
       id: nextMessageId(),
@@ -1064,14 +1072,80 @@ export default function App() {
 
   const canSend = chatInput.trim().length > 0 && !loading;
 
-  async function startSession(classId: string) {
+  const scheduleStepShowsGrid =
+    response?.step === 'schedule' || response?.step === 'completed';
+
+  const canSaveCurrentSchedule =
+    Boolean(sessionId) &&
+    scheduleStepShowsGrid &&
+    displaySchedule != null &&
+    !savingSchedule &&
+    !savedScheduleId;
+
+  function handleSaveScheduleNo() {
+    appendMessages([{ role: 'assistant', text: 'OK — tell me if you want any other changes.' }]);
+  }
+
+  async function saveCurrentSchedule(targetSessionId: string) {
+    setSavingSchedule(true);
+    setError('');
+    try {
+      const controller = new AbortController();
+      const saveTimeoutMs = 15 * 60 * 1000;
+      const timeoutId = window.setTimeout(() => controller.abort(), saveTimeoutMs);
+      const res = await fetch(`${apiBase}/ai-rotational/session/save`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ sessionId: targetSessionId }),
+        signal: controller.signal,
+      });
+      window.clearTimeout(timeoutId);
+      const raw = (await res.json()) as Record<string, unknown>;
+      const unwrapped = unwrapAiRotationalPayload(raw) as Record<string, unknown>;
+      if (!res.ok) {
+        const errMsg =
+          (typeof unwrapped.assistantMessage === 'string' && unwrapped.assistantMessage) ||
+          (typeof raw.message === 'string' && raw.message) ||
+          'Save failed';
+        throw new Error(errMsg);
+      }
+      const scheduleId =
+        typeof unwrapped.scheduleId === 'string' ? unwrapped.scheduleId : '';
+      if (scheduleId) {
+        setSavedScheduleId(scheduleId);
+      }
+      const assistantMessage =
+        typeof unwrapped.assistantMessage === 'string'
+          ? unwrapped.assistantMessage
+          : 'Schedule saved successfully.';
+      appendMessages([{ role: 'assistant', text: assistantMessage }]);
+    } catch (e) {
+      const msg =
+        e instanceof Error && e.name === 'AbortError'
+          ? 'Save timed out after 15 minutes. The schedule may still be saving on the server — check Star Academy or server logs ([session/save]).'
+          : e instanceof Error
+            ? e.message
+            : 'Save failed';
+      setError(msg);
+      appendMessages([{ role: 'assistant', text: `Something went wrong: ${msg}`, isError: true }]);
+    } finally {
+      setSavingSchedule(false);
+    }
+  }
+
+  async function startSession(classId: string, initialMessage?: string) {
     setLoading(true);
     setError('');
     try {
+      const body: { classId: string; message?: string } = { classId };
+      const seed = initialMessage?.trim();
+      if (seed) {
+        body.message = seed;
+      }
       const res = await fetch(`${apiBase}/ai-rotational/session/message`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ classId }),
+        body: JSON.stringify(body),
       });
       const raw = (await res.json()) as Record<string, unknown>;
       const unwrapped = unwrapAiRotationalPayload(raw) as Record<string, unknown>;
@@ -1159,9 +1233,11 @@ export default function App() {
         ...prev,
         {
           id: `s-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
+          sessionId,
           classId: currentClassId,
           schedule,
           generatedAt: Date.now(),
+          savedScheduleId: savedScheduleId ?? undefined,
         },
       ]);
     }
@@ -1169,6 +1245,7 @@ export default function App() {
     setCurrentClassId('');
     setResponse(null);
     setPersistedSchedule(null);
+    setSavedScheduleId(null);
     setStudentSelection([]);
     setModuleSelection([]);
     setScheduleTypeSelection('');
@@ -1206,7 +1283,7 @@ export default function App() {
       const inlineClassId = extractClassIdFromMessage(message);
       const handled = archiveCurrentScheduleAndResetForNewFlow(message);
       if (handled && inlineClassId) {
-        await startSession(inlineClassId);
+        await startSession(inlineClassId, message);
       }
       return;
     }
@@ -1219,7 +1296,7 @@ export default function App() {
          */
         const inlineClassIdEarly = extractClassIdFromMessage(message);
         if (inlineClassIdEarly) {
-          await startSession(inlineClassIdEarly);
+          await startSession(inlineClassIdEarly, message);
           return;
         }
         if (!isRotationalIntent(message)) {
@@ -1245,7 +1322,7 @@ export default function App() {
         ]);
         return;
       }
-      await startSession(inlineClassId);
+      await startSession(inlineClassId, message);
       return;
     }
     await sendMessage(message);
@@ -1691,7 +1768,19 @@ export default function App() {
       return (
         <div className="schedule-in-chat">
           {message.text && <p className="bubble-text bubble-text-tight">{message.text}</p>}
-          <ScheduleGridTable schedule={message.schedule} scrollable />
+          <ScheduleGridTable
+            schedule={message.schedule}
+            scrollable={!message.showSavePrompt}
+            savePrompt={
+              message.showSavePrompt && !savedScheduleId
+                ? {
+                    onNo: handleSaveScheduleNo,
+                    onYes: () => void saveCurrentSchedule(sessionId),
+                    saving: savingSchedule,
+                  }
+                : undefined
+            }
+          />
         </div>
       );
     }
@@ -1703,6 +1792,17 @@ export default function App() {
       return <pre className="bubble-text bubble-pre-table">{message.text}</pre>;
     }
     return <p className="bubble-text">{message.text}</p>;
+  }
+
+  if (scheduleFullView) {
+    return (
+      <ScheduleFullPageRoute
+        onClose={() => {
+          closeScheduleFullView();
+          setScheduleFullView(false);
+        }}
+      />
+    );
   }
 
   return (
@@ -1763,14 +1863,55 @@ export default function App() {
 
         {error && <p className="error">{error}</p>}
 
+        {scheduleStepShowsGrid && displaySchedule && (
+          <div className="step-panels schedule-below-chat">
+            <section className="step-card schedule-card">
+              <h2 className="step-title">Generated schedule</h2>
+              <ScheduleGridTable schedule={displaySchedule} scrollable expandTitle="Generated schedule" />
+              <footer className="schedule-save-footer">
+                {savedScheduleId ? (
+                  <p className="schedule-save-status">Saved to Star Academy (scheduleId: {savedScheduleId})</p>
+                ) : (
+                  <button
+                    type="button"
+                    className="btn btn-save-schedule"
+                    disabled={!canSaveCurrentSchedule}
+                    onClick={() => void saveCurrentSchedule(sessionId)}
+                  >
+                    {savingSchedule ? 'Saving…' : 'Yes, save'}
+                  </button>
+                )}
+              </footer>
+            </section>
+          </div>
+        )}
+
         {completedSchedules.map((entry, index) => (
           <div key={entry.id} className="step-panels schedule-below-chat">
-            <section className="step-card">
+            <section className="step-card schedule-card">
               <h2 className="step-title">
                 Schedule {index + 1}
-                {entry.classId ? `  Class ${entry.classId}` : ''}
+                {entry.classId ? ` — Class ${entry.classId}` : ''}
               </h2>
-              <ScheduleGridTable schedule={entry.schedule} scrollable />
+              <ScheduleGridTable
+                schedule={entry.schedule}
+                scrollable
+                expandTitle={`Schedule ${index + 1}${entry.classId ? ` — Class ${entry.classId}` : ''}`}
+              />
+              <footer className="schedule-save-footer">
+                {entry.savedScheduleId ? (
+                  <p className="schedule-save-status">Saved (scheduleId: {entry.savedScheduleId})</p>
+                ) : (
+                  <button
+                    type="button"
+                    className="btn btn-save-schedule"
+                    disabled={savingSchedule}
+                    onClick={() => void saveCurrentSchedule(entry.sessionId)}
+                  >
+                    {savingSchedule ? 'Saving…' : 'Yes, save'}
+                  </button>
+                )}
+              </footer>
             </section>
           </div>
         ))}
