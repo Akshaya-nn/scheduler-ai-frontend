@@ -1857,7 +1857,7 @@ export default function App() {
             className="input"
           />
           <button disabled={!canSend} type="submit" className="btn">
-            {loading ? 'Sending¦' : 'Send'}
+            {loading ? 'Sending...' : 'Send'}
           </button>
         </form>
 
