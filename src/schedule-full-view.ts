@@ -80,10 +80,7 @@ export function closeScheduleFullView(): void {
   if (!isScheduleFullViewPath()) {
     return;
   }
-  if (window.history.length > 1) {
-    window.history.back();
-    return;
-  }
+  /** Always return to the chat app root — avoid history.back() leaving the site or closing the tab. */
   const home = BASE || '/';
   window.history.pushState({}, '', home);
   notifyViewSync();

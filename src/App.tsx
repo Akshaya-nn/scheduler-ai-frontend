@@ -1863,7 +1863,7 @@ export default function App() {
 
         {error && <p className="error">{error}</p>}
 
-        {scheduleStepShowsGrid && displaySchedule && (
+        {/* {scheduleStepShowsGrid && displaySchedule && (
           <div className="step-panels schedule-below-chat">
             <section className="step-card schedule-card">
               <h2 className="step-title">Generated schedule</h2>
@@ -1884,7 +1884,7 @@ export default function App() {
               </footer>
             </section>
           </div>
-        )}
+        )} */}
 
         {completedSchedules.map((entry, index) => (
           <div key={entry.id} className="step-panels schedule-below-chat">
