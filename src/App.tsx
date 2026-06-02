@@ -1,4 +1,5 @@
 import { FormEvent, Fragment, useCallback, useEffect, useRef, useState } from 'react';
+import { resolveConversationalReply } from './conversational-message';
 import { ScheduleFullPageRoute } from './ScheduleFullPage';
 import {
   closeScheduleFullView,
@@ -706,7 +707,12 @@ function ScheduleGridTable({
   expandTitle?: string;
 }) {
   const rotationCols = scheduleRotationColumnCount(schedule);
-  const orderedRows = scheduleRowDisplayOrder(schedule);
+  const rowLen = schedule.rowData?.length ?? 0;
+  const seatLen = schedule.seats?.length ?? 0;
+  const orderedRows =
+    rowLen > 0 && rowLen === seatLen
+      ? Array.from({ length: rowLen }, (_, i) => i)
+      : scheduleRowDisplayOrder(schedule);
   const useScroll = scrollable || Boolean(savePrompt);
 
   const openFullPage = () => {
@@ -1214,30 +1220,41 @@ export default function App() {
     copyModuleCount?: number;
   };
 
-  async function sendMessage(payload: string | SessionModuleIdsPayload) {
+  type SessionStudentIdsPayload = {
+    studentIds: string[];
+  };
+
+  /** POST session/message body — module/student picks use structured fields, not `message`. */
+  function buildSessionMessageBody(
+    activeSessionId: string,
+    payload: string | SessionModuleIdsPayload | SessionStudentIdsPayload,
+  ): Record<string, unknown> {
+    if (typeof payload === 'string') {
+      return { sessionId: activeSessionId, message: payload };
+    }
+    if ('studentIds' in payload) {
+      return { sessionId: activeSessionId, studentIds: payload.studentIds };
+    }
+    const body: Record<string, unknown> = {
+      sessionId: activeSessionId,
+      moduleIds: payload.moduleIds,
+    };
+    if (payload.copyEachSelectedModule === true) {
+      const parsed = payload.copyModuleCount;
+      body.copyEachSelectedModule = true;
+      body.copyModuleCount =
+        typeof parsed === 'number' && Number.isInteger(parsed) && parsed >= 1 ? parsed : 1;
+    }
+    return body;
+  }
+
+  async function sendMessage(payload: string | SessionModuleIdsPayload | SessionStudentIdsPayload) {
     const activeSessionId = sessionId;
     if (!activeSessionId) return;
     setLoading(true);
     setError('');
     try {
-      const body =
-        typeof payload === 'string'
-          ? { sessionId: activeSessionId, message: payload }
-          : {
-              sessionId: activeSessionId,
-              moduleIds: payload.moduleIds,
-              ...(payload.copyEachSelectedModule === true
-                ? {
-                    copyEachSelectedModule: true,
-                    copyModuleCount:
-                      typeof payload.copyModuleCount === 'number' &&
-                      Number.isInteger(payload.copyModuleCount) &&
-                      payload.copyModuleCount >= 1
-                        ? payload.copyModuleCount
-                        : 1,
-                  }
-                : {}),
-            };
+      const body = buildSessionMessageBody(activeSessionId, payload);
       const res = await fetch(`${apiBase}/ai-rotational/session/message`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -1325,6 +1342,11 @@ export default function App() {
     }
 
     if (!sessionId) {
+      const conversationalReply = resolveConversationalReply(message);
+      if (conversationalReply) {
+        appendMessages([{ role: 'assistant', text: conversationalReply }]);
+        return;
+      }
       if (chatMode === 'awaiting_intent') {
         /**
          * Accept a bare Mongo ObjectId (or message that contains one) before
@@ -1375,10 +1397,7 @@ export default function App() {
       p.kind === 'students' ? { ...p, frozen: true, selectedIds: [...studentSelection] } : p,
     );
     appendUserSelection(`Selected students (${names.length})`, names);
-    const idsJson = JSON.stringify(studentSelection);
-    await sendMessage(
-      `I confirm these students for the rotation: ${names.join(', ')}. Call select_students with studentIds exactly ${idsJson}, then continue the workflow.`,
-    );
+    await sendMessage({ studentIds: [...studentSelection] });
   }
 
   async function confirmScheduleTypeSelection() {
@@ -1943,13 +1962,13 @@ export default function App() {
             className="input"
           />
           <button disabled={!canSend} type="submit" className="btn">
-            {loading ? 'Sending¦' : 'Send'}
+            {loading ? 'Sending...' : 'Send'}
           </button>
         </form>
 
         {error && <p className="error">{error}</p>}
 
-        {scheduleStepShowsGrid && displaySchedule && (
+        {/* {scheduleStepShowsGrid && displaySchedule && (
           <div className="step-panels schedule-below-chat">
             <section className="step-card schedule-card">
               <h2 className="step-title">Generated schedule</h2>
@@ -1970,7 +1989,7 @@ export default function App() {
               </footer>
             </section>
           </div>
-        )}
+        )} */}
 
         {completedSchedules.map((entry, index) => (
           <div key={entry.id} className="step-panels schedule-below-chat">
