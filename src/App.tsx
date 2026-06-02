@@ -29,11 +29,19 @@ type Student = { id: string; fullName: string };
 type ModuleItem = { id: string; name: string };
 type ScheduleTypeItem = { id: string; name: string; type: string };
 type SeatCell = { 0: { id: string; fullName: string }; 1: { id: string; fullName: string } };
+type SchedulePayload = {
+  seats: SeatCell[][];
+  rowData: Array<{ id?: string; moduleName: string }>;
+  rowCount: number;
+  colCount: number;
+  warnings: string[];
+};
 
 /** Public API `step` ” what the client should show next (matches server `SelectionStep`). */
 type ResponseStep =
   | 'schedule_types'
   | 'modules'
+  | 'schedule_compare'
   | 'students'
   | 'rotation_range'
   | 'rotation_count'
@@ -57,13 +65,23 @@ type ApiResponse = {
   selectedScheduleType?: { type: string; name: string } | null;
   selectedStudents?: Student[];
   selectedModules?: ModuleItem[];
-  schedule?: {
-    seats: SeatCell[][];
-    rowData: Array<{ id?: string; moduleName: string }>;
-    rowCount: number;
-    colCount: number;
-    warnings: string[];
-  } | null;
+  schedule?: SchedulePayload | null;
+  scheduleOptions?: {
+    optionA: {
+      label: string;
+      studentCount: number;
+      moduleCount: number;
+      rotationCount: number;
+      schedule: SchedulePayload;
+    };
+    optionB: {
+      label: string;
+      studentCount: number;
+      moduleCount: number;
+      rotationCount: number;
+      schedule: SchedulePayload;
+    };
+  };
   config?: {
     startRotation?: number;
     endRotation?: number;
@@ -121,6 +139,12 @@ function mergePartialAiResponse(prev: ApiResponse | null, incoming: Record<strin
       i.selectedScheduleType !== undefined ? i.selectedScheduleType : prev?.selectedScheduleType,
     selectedStudents,
     selectedModules,
+    scheduleOptions:
+      i.scheduleOptions !== undefined
+        ? i.scheduleOptions
+        : step === 'schedule_compare'
+          ? prev?.scheduleOptions
+          : undefined,
     schedule: i.schedule !== undefined ? i.schedule : (prev?.schedule ?? null),
     config: i.config !== undefined ? i.config : prev?.config,
   };
@@ -178,6 +202,8 @@ type ChatMessage = {
   schedule?: NonNullable<ApiResponse['schedule']>;
   /** Show Yes/No save footer under the grid in this bubble */
   showSavePrompt?: boolean;
+  /** Inline two-schedule compare card (Option A / B) */
+  scheduleOptions?: NonNullable<ApiResponse['scheduleOptions']>;
   /** Inline checklist / picker (single assistant bubble ” no duplicate text above) */
   picker?: ChatPicker;
 };
@@ -452,6 +478,16 @@ function buildAssistantChatEntriesFromResponse(data: ApiResponse): Omit<ChatMess
           copyModuleCount: '1',
           contentLabel: data.selectedScheduleType?.type === 'expedition' ? 'Expedition' : 'Module',
         },
+      },
+    ];
+  }
+
+  if (step === 'schedule_compare' && data.scheduleOptions) {
+    return [
+      {
+        role: 'assistant',
+        text: raw,
+        scheduleOptions: data.scheduleOptions,
       },
     ];
   }
@@ -1784,6 +1820,56 @@ export default function App() {
         </div>
       );
     }
+    if (message.scheduleOptions) {
+      const options = message.scheduleOptions;
+      return (
+        <div className="schedule-compare">
+          {message.text?.trim() && <p className="bubble-text bubble-text-tight">{message.text}</p>}
+          <div className="schedule-compare-grid">
+            <div className="schedule-compare-card">
+              <h3 className="schedule-compare-title">{options.optionA.label}</h3>
+              <p className="schedule-compare-meta">
+                {options.optionA.studentCount} students • {options.optionA.moduleCount} rows • {options.optionA.rotationCount} rotations
+              </p>
+              <ScheduleGridTable schedule={options.optionA.schedule} scrollable />
+              <div className="bubble-actions">
+                <button
+                  className="btn primary"
+                  type="button"
+                  disabled={loading}
+                  onClick={() => {
+                    appendUserText('Option A');
+                    void sendMessage('Option A');
+                  }}
+                >
+                  Choose Option A
+                </button>
+              </div>
+            </div>
+            <div className="schedule-compare-card">
+              <h3 className="schedule-compare-title">{options.optionB.label}</h3>
+              <p className="schedule-compare-meta">
+                {options.optionB.studentCount} students • {options.optionB.moduleCount} rows • {options.optionB.rotationCount} rotations
+              </p>
+              <ScheduleGridTable schedule={options.optionB.schedule} scrollable />
+              <div className="bubble-actions">
+                <button
+                  className="btn primary"
+                  type="button"
+                  disabled={loading}
+                  onClick={() => {
+                    appendUserText('Option B');
+                    void sendMessage('Option B');
+                  }}
+                >
+                  Choose Option B
+                </button>
+              </div>
+            </div>
+          </div>
+        </div>
+      );
+    }
     if (message.picker) {
       return renderInlinePicker(message);
     }
@@ -1824,7 +1910,7 @@ export default function App() {
               >
                 <div className="msg-meta">{message.role === 'user' ? 'You' : 'Assistant'}</div>
                 <div
-                  className={`bubble ${message.role === 'user' ? 'bubble-user' : 'bubble-assistant'}${message.schedule ? ' bubble-has-schedule' : ''}${message.picker ? ' bubble-embed' : ''}`}
+                  className={`bubble ${message.role === 'user' ? 'bubble-user' : 'bubble-assistant'}${message.schedule ? ' bubble-has-schedule' : ''}${message.scheduleOptions ? ' bubble-has-compare' : ''}${message.picker ? ' bubble-embed' : ''}`}
                 >
                   {body}
                 </div>
