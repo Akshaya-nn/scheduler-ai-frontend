@@ -1,1 +1,1 @@
-{"root":["./src/app.tsx","./src/schedulefullpage.tsx","./src/main.tsx","./src/schedule-full-view.ts","./src/vite-env.d.ts"],"version":"5.9.3"}
+{"root":["./src/app.tsx","./src/schedulefullpage.tsx","./src/conversational-message.ts","./src/main.tsx","./src/schedule-full-view.ts","./src/vite-env.d.ts"],"version":"5.9.3"}

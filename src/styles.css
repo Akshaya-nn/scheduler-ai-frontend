@@ -300,6 +300,19 @@ body { margin: 0; -webkit-font-smoothing: antialiased; }
   color: var(--grey-30);
 }
 
+.schedule-compare-chosen {
+  width: 100%;
+}
+
+.schedule-compare-card-chosen {
+  max-width: 100%;
+}
+
+.schedule-save-footer-inline {
+  margin-top: 0;
+  border-radius: 0 0 10px 10px;
+}
+
 /* Custom scrollbar */
 .chat-thread::-webkit-scrollbar { width: 5px; }
 .chat-thread::-webkit-scrollbar-track { background: transparent; }
@@ -319,6 +332,16 @@ body { margin: 0; -webkit-font-smoothing: antialiased; }
 
 .msg-row-user    { align-items: flex-end; }
 .msg-row-assistant { align-items: flex-start; }
+
+.msg-row-wide {
+  width: 100%;
+  align-self: stretch;
+}
+
+.msg-row-wide .bubble {
+  max-width: 100%;
+  width: 100%;
+}
 
 .msg-row-error .bubble-assistant {
   border-color: rgba(248, 113, 113, 0.35);
@@ -1212,7 +1235,7 @@ body { margin: 0; -webkit-font-smoothing: antialiased; }
 
   .bubble-has-schedule,
   .bubble-has-schedule.bubble {
-    max-width: 100%;
+    max-width: min(96%, 680px);
   }
 
   .schedule-in-chat {
