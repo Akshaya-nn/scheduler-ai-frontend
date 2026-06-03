@@ -201,6 +201,8 @@ type ChatMessage = {
   preformatted?: boolean;
   /** Frozen schedule grid shown inside the chat bubble */
   schedule?: NonNullable<ApiResponse['schedule']>;
+  /** Shown between the Done line and the grid (student/assign/check preview). */
+  assignCheckNotice?: string;
   /** Show Yes/No save footer under the grid in this bubble */
   showSavePrompt?: boolean;
   /** Inline two-schedule compare card (Option A / B) */
@@ -406,10 +408,12 @@ function buildAssistantChatEntriesFromResponse(data: ApiResponse): Omit<ChatMess
   const step = data.step;
 
   if (grid && (step === 'completed' || step === 'schedule')) {
+    const { doneText, assignCheckNotice } = splitDoneAndAssignCheckNotice(raw);
     return [
       {
         role: 'assistant',
-        text: raw || 'Here is your generated schedule.',
+        text: doneText || 'Here is your generated schedule.',
+        ...(assignCheckNotice ? { assignCheckNotice } : {}),
         schedule: grid,
         showSavePrompt: true,
       },
@@ -527,6 +531,36 @@ function buildAssistantChatEntriesFromResponse(data: ApiResponse): Omit<ChatMess
     preformatted: text.includes('| --- |'),
     isError: assistantMessageLooksLikeError(text),
   }));
+}
+
+const EXISTING_ASSIGNMENTS_MESSAGE_PREFIX = 'Found existing assignments';
+
+function splitDoneAndAssignCheckNotice(assistantMessage: string): {
+  doneText: string;
+  assignCheckNotice: string | null;
+} {
+  const raw = assistantMessage.trim();
+  const idx = raw.indexOf(EXISTING_ASSIGNMENTS_MESSAGE_PREFIX);
+  if (idx < 0) {
+    return { doneText: raw, assignCheckNotice: null };
+  }
+  const doneText = raw.slice(0, idx).trim();
+  const assignCheckNotice = raw.slice(idx).trim();
+  return {
+    doneText: doneText.length > 0 ? doneText : raw,
+    assignCheckNotice: assignCheckNotice.length > 0 ? assignCheckNotice : null,
+  };
+}
+
+function isScheduleDoneAckText(text?: string): boolean {
+  if (!text?.trim()) {
+    return false;
+  }
+  return /\bDone\b/i.test(text) || /\bschedule updated\b/i.test(text);
+}
+
+function isScheduleGenerationStep(step: ApiResponse['step'] | undefined): boolean {
+  return step === 'completed' || step === 'schedule';
 }
 
 function filterNewScheduleChatEntries(
@@ -692,6 +726,40 @@ function catalogIdFromExpandedModuleRowId(id: string): string {
   return id.replace(/::__copy_\d+(?:_\d+)?$/i, '');
 }
 
+function normalizeModuleCatalogIds(ids: string[]): string[] {
+  return Array.from(new Set(ids.map((id) => catalogIdFromExpandedModuleRowId(id.trim())).filter((id) => id.length > 0)));
+}
+
+function resolveModuleCatalogIdsForAssignCheck(
+  resp: ApiResponse | null,
+  modulePayloadIds?: string[],
+): string[] {
+  if (modulePayloadIds && modulePayloadIds.length > 0) {
+    return normalizeModuleCatalogIds(modulePayloadIds);
+  }
+  if ((resp?.selectedModules?.length ?? 0) > 0) {
+    return normalizeModuleCatalogIds((resp?.selectedModules ?? []).map((module) => module.id));
+  }
+  return [];
+}
+
+/** Call `student/assign/check` before turns that can generate or regenerate the grid. */
+function shouldRunAssignCheckBeforeSend(
+  payload: string | { moduleIds: string[] } | { studentIds: string[] },
+  moduleCatalogIds: string[],
+): boolean {
+  if (moduleCatalogIds.length === 0) {
+    return false;
+  }
+  if (typeof payload !== 'string' && 'moduleIds' in payload) {
+    return true;
+  }
+  if (typeof payload === 'string') {
+    return /start rotation exactly/i.test(payload) || /end rotation exactly/i.test(payload);
+  }
+  return false;
+}
+
 function ScheduleGridTable({
   schedule,
   scrollable = false,
@@ -846,6 +914,13 @@ export default function App() {
   ]);
 
   const chatThreadRef = useRef<HTMLDivElement>(null);
+  /**
+   * Student ids sent to `student/assign/check` on module confirm.
+   * `['all']` until the user confirms the student checklist; then the confirmed selection.
+   */
+  const assignCheckStudentIdsRef = useRef<string[]>(['all']);
+  /** Set when the user confirms the student checklist or sends structured studentIds. */
+  const studentRosterTouchedRef = useRef(false);
   /** Skip duplicate schedule cards in chat when the grid unchanged. */
   const lastChatScheduleFingerprintRef = useRef<string | null>(null);
   /** True once the user has reached `completed` with a grid ” used to skip chat auto-scroll during module-edit interrupts. */
@@ -957,25 +1032,62 @@ export default function App() {
   ]);
 
   const appendAssistantEntriesFromResponse = useCallback((data: ApiResponse) => {
+    const grid = pickScheduleFromPayload(data);
+    const scheduleTurn = Boolean(grid && isScheduleGenerationStep(data.step));
+    const { doneText, assignCheckNotice } = splitDoneAndAssignCheckNotice(data.assistantMessage ?? '');
     const entries = filterNewScheduleChatEntries(
       buildAssistantChatEntriesFromResponse(data),
       lastChatScheduleFingerprintRef,
     );
-    if (entries.length === 0) {
+    if (entries.length === 0 && !scheduleTurn) {
       return;
     }
+
     setChatMessages((prev) => {
+      let next = prev;
       const toAdd: ChatMessage[] = [];
+
       for (const entry of entries) {
         if (
           entry.picker &&
-          prev.some((m) => m.picker?.kind === entry.picker!.kind && !m.picker.frozen)
+          next.some((m) => m.picker?.kind === entry.picker!.kind && !m.picker.frozen)
         ) {
           continue;
         }
+
+        if (!entry.schedule && isScheduleDoneAckText(entry.text) && scheduleTurn && grid) {
+          const fp = scheduleFingerprint(grid);
+          let mergedIntoExisting = false;
+          for (let i = next.length - 1; i >= 0; i--) {
+            const existing = next[i];
+            if (
+              existing.role !== 'assistant' ||
+              !existing.schedule ||
+              scheduleFingerprint(existing.schedule) !== fp
+            ) {
+              continue;
+            }
+            next = [
+              ...next.slice(0, i),
+              {
+                ...existing,
+                text: doneText || splitDoneAndAssignCheckNotice(entry.text ?? '').doneText || existing.text,
+                ...(assignCheckNotice ? { assignCheckNotice } : {}),
+              },
+              ...next.slice(i + 1),
+            ];
+            mergedIntoExisting = true;
+            break;
+          }
+          if (mergedIntoExisting) {
+            continue;
+          }
+        }
+
         toAdd.push({ ...entry, id: nextMessageId() });
       }
-      return toAdd.length > 0 ? [...prev, ...toAdd] : prev;
+
+      return toAdd.length > 0 ? [...next, ...toAdd] : next;
     });
   }, []);
 
@@ -1050,6 +1162,23 @@ export default function App() {
     }
     setStudentSelection((response.selectedStudents ?? []).map((s) => s.id));
   }, [response?.sessionId, response?.step, selectedStudentIdsSig]);
+
+  /** After a roster update, keep assign-check studentIds aligned with the server selection. */
+  useEffect(() => {
+    if (!response?.sessionId || !studentRosterTouchedRef.current) {
+      return;
+    }
+    const selectedIds = Array.from(
+      new Set(
+        (response.selectedStudents ?? [])
+          .map((student) => student.id.trim())
+          .filter((id) => id.length > 0),
+      ),
+    );
+    if (selectedIds.length > 0) {
+      assignCheckStudentIdsRef.current = selectedIds;
+    }
+  }, [response?.sessionId, selectedStudentIdsSig]);
 
   /** Reset the schedule-type radio selection whenever the list or step changes. */
   const scheduleTypesSig = (response?.scheduleTypes ?? []).map((t) => t.id).join('|');
@@ -1204,6 +1333,8 @@ export default function App() {
       setPersistedSchedule(mergePersistedSchedule(data, null));
       setStudentSelection([]);
       setModuleSelection([]);
+      assignCheckStudentIdsRef.current = ['all'];
+      studentRosterTouchedRef.current = false;
       setCopyEachModule(false);
       setCopyModuleCount('1');
       appendAssistantEntriesFromResponse(data);
@@ -1224,18 +1355,35 @@ export default function App() {
     studentIds: string[];
   };
 
-type StudentAssignCheckResponse = {
-  moduleList?: Array<{
-    moduleId: string;
-    moduleName?: string;
-    student?: Array<{ id: string; fullName: string }>;
-  }>;
-};
+  type StudentAssignCheckResponse = {
+    moduleList?: Array<{
+      moduleId: string;
+      moduleName?: string;
+      student?: Array<{ id: string; fullName: string }>;
+    }>;
+  };
 
-type DropdownStudentListResponse = {
-  studentList?: Array<{ id: string; studentName?: string }>;
-  message?: string;
-};
+  async function checkAssignedStudentsBeforeModuleConfirm(params: {
+    classId: string;
+    moduleIds: string[];
+    studentIds: string[];
+  }): Promise<StudentAssignCheckResponse> {
+    const res = await fetch(`${apiBase}/ai-rotational/student/assign/check`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        classId: params.classId,
+        scheduleId: '',
+        moduleIds: params.moduleIds,
+        studentIds: params.studentIds,
+      }),
+    });
+    const data = (await res.json()) as StudentAssignCheckResponse & { message?: string };
+    if (!res.ok) {
+      throw new Error(data.message ?? 'student/assign/check failed');
+    }
+    return data;
+  }
 
   /** POST session/message body — module/student picks use structured fields, not `message`. */
   function buildSessionMessageBody(
@@ -1261,12 +1409,40 @@ type DropdownStudentListResponse = {
     return body;
   }
 
-  async function sendMessage(payload: string | SessionModuleIdsPayload | SessionStudentIdsPayload) {
+  async function sendMessage(
+    payload: string | SessionModuleIdsPayload | SessionStudentIdsPayload,
+  ): Promise<boolean> {
     const activeSessionId = sessionId;
-    if (!activeSessionId) return;
+    if (!activeSessionId) return false;
+
+    if (typeof payload !== 'string' && 'studentIds' in payload) {
+      assignCheckStudentIdsRef.current = [...payload.studentIds];
+      studentRosterTouchedRef.current = true;
+    }
+
+    const moduleCatalogIds = resolveModuleCatalogIdsForAssignCheck(
+      response,
+      typeof payload !== 'string' && 'moduleIds' in payload ? payload.moduleIds : undefined,
+    );
+    const needsAssignCheck = shouldRunAssignCheckBeforeSend(payload, moduleCatalogIds);
+
     setLoading(true);
     setError('');
     try {
+      if (needsAssignCheck && currentClassId) {
+        try {
+          await checkAssignedStudentsBeforeModuleConfirm({
+            classId: currentClassId,
+            moduleIds: moduleCatalogIds,
+            studentIds: assignCheckStudentIdsRef.current,
+          });
+        } catch (err) {
+          const msg = err instanceof Error ? err.message : 'student/assign/check failed';
+          setError(msg);
+          appendMessages([{ role: 'assistant', text: `Something went wrong: ${msg}`, isError: true }]);
+          return false;
+        }
+      }
       const body = buildSessionMessageBody(activeSessionId, payload);
       const res = await fetch(`${apiBase}/ai-rotational/session/message`, {
         method: 'POST',
@@ -1284,53 +1460,14 @@ type DropdownStudentListResponse = {
       setResponse(merged);
       setPersistedSchedule((prev) => mergePersistedSchedule(merged, prev));
       appendAssistantEntriesFromResponse(merged);
+      return true;
     } catch (err) {
       setError((err as Error).message);
       appendMessages([{ role: 'assistant', text: `Something went wrong: ${(err as Error).message}`, isError: true }]);
+      return false;
     } finally {
       setLoading(false);
     }
-  }
-
-  async function checkAssignedStudentsBeforeModuleConfirm(params: {
-    classId: string;
-    moduleIds: string[];
-    studentIds: string[];
-  }): Promise<StudentAssignCheckResponse> {
-    const res = await fetch(`${apiBase}/ai-rotational/student/assign/check`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        classId: params.classId,
-        scheduleId: '',
-        moduleIds: params.moduleIds,
-        studentIds: params.studentIds,
-      }),
-    });
-    const data = (await res.json()) as StudentAssignCheckResponse & { message?: string };
-    if (!res.ok) {
-      throw new Error(data.message ?? 'student/assign/check failed');
-    }
-    return data;
-  }
-
-  async function fetchAllClassStudentIds(classId: string): Promise<string[]> {
-    const res = await fetch(`${apiBase}/dropdown/student/list`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ classId }),
-    });
-    const data = (await res.json()) as DropdownStudentListResponse;
-    if (!res.ok) {
-      throw new Error(data.message ?? 'Failed to load class students');
-    }
-    return Array.from(
-      new Set(
-        (data.studentList ?? [])
-          .map((row) => (typeof row.id === 'string' ? row.id.trim() : ''))
-          .filter((id) => id.length > 0),
-      ),
-    );
   }
 
   function archiveCurrentScheduleAndResetForNewFlow(triggerMessage: string): boolean {
@@ -1355,6 +1492,8 @@ type DropdownStudentListResponse = {
     setSavedScheduleId(null);
     setStudentSelection([]);
     setModuleSelection([]);
+    assignCheckStudentIdsRef.current = ['all'];
+    studentRosterTouchedRef.current = false;
     setScheduleTypeSelection('');
     setCopyEachModule(false);
     setCopyModuleCount('1');
@@ -1451,6 +1590,8 @@ type DropdownStudentListResponse = {
       p.kind === 'students' ? { ...p, frozen: true, selectedIds: [...studentSelection] } : p,
     );
     appendUserSelection(`Selected students (${names.length})`, names);
+    studentRosterTouchedRef.current = true;
+    assignCheckStudentIdsRef.current = [...studentSelection];
     await sendMessage({ studentIds: [...studentSelection] });
   }
 
@@ -1473,60 +1614,9 @@ type DropdownStudentListResponse = {
     if (loading) return;
     if (moduleSelection.length === 0) return;
     if (!currentClassId) return;
-    const selectedStudentIds = Array.from(
-      new Set(
-        [
-          ...(response.selectedStudents ?? []).map((s) => s.id),
-          ...studentSelection,
-          ...(response.students ?? []).map((s) => s.id),
-        ].filter((id) => typeof id === 'string' && id.trim().length > 0),
-      ),
-    );
-    let studentIdsForCheck = selectedStudentIds;
-    if (studentIdsForCheck.length === 0) {
-      try {
-        studentIdsForCheck = await fetchAllClassStudentIds(currentClassId);
-      } catch (err) {
-        const msg = err instanceof Error ? err.message : 'Failed to load class students';
-        setError(msg);
-        appendMessages([{ role: 'assistant', text: `Something went wrong: ${msg}`, isError: true }]);
-        return;
-      }
-    }
-    if (studentIdsForCheck.length === 0) {
-      appendMessages([{ role: 'assistant', text: 'No students available for this class.', isError: true }]);
-      return;
-    }
-    const moduleIds = [...new Set(moduleSelection.map((id) => catalogIdFromExpandedModuleRowId(id)))];
     const names = moduleSelection
       .map((id) => response.modules.find((m) => m.id === id)?.name ?? id)
       .filter(Boolean);
-    try {
-      const assignCheck = await checkAssignedStudentsBeforeModuleConfirm({
-        classId: currentClassId,
-        moduleIds,
-        studentIds: studentIdsForCheck,
-      });
-      const assignedRows = assignCheck.moduleList ?? [];
-      if (assignedRows.length > 0) {
-        const preview = assignedRows
-          .slice(0, 4)
-          .map((row) => {
-            const studentNames = (row.student ?? [])
-              .map((s) => s.fullName)
-              .filter((n) => n.trim().length > 0)
-              .slice(0, 4)
-              .join(', ');
-            return `${row.moduleName ?? row.moduleId}: ${studentNames}`;
-          })
-          .join(' | ');
-      }
-    } catch (err) {
-      const msg = err instanceof Error ? err.message : 'student/assign/check failed';
-      setError(msg);
-      appendMessages([{ role: 'assistant', text: `Something went wrong: ${msg}`, isError: true }]);
-      return;
-    }
     freezePickerInChat('modules', (p) =>
       p.kind === 'modules'
         ? {
@@ -1929,6 +2019,9 @@ type DropdownStudentListResponse = {
       return (
         <div className="schedule-in-chat">
           {message.text && <p className="bubble-text bubble-text-tight">{message.text}</p>}
+          {message.assignCheckNotice && (
+            <p className="bubble-text bubble-text-tight bubble-assign-check-notice">{message.assignCheckNotice}</p>
+          )}
           <ScheduleGridTable
             schedule={message.schedule}
             scrollable={!message.showSavePrompt}
@@ -2001,6 +2094,14 @@ type DropdownStudentListResponse = {
 
     if (message.preformatted && message.text) {
       return <pre className="bubble-text bubble-pre-table">{message.text}</pre>;
+    }
+    if (message.assignCheckNotice) {
+      return (
+        <>
+          {message.text?.trim() ? <p className="bubble-text">{message.text}</p> : null}
+          <p className="bubble-text bubble-text-tight bubble-assign-check-notice">{message.assignCheckNotice}</p>
+        </>
+      );
     }
     return <p className="bubble-text">{message.text}</p>;
   }

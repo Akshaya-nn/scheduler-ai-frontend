@@ -417,6 +417,12 @@ body { margin: 0; -webkit-font-smoothing: antialiased; }
   min-width: 0;
 }
 
+.bubble-assign-check-notice {
+  color: var(--grey-30, #c8d0e0);
+  line-height: 1.45;
+  margin-bottom: 4px;
+}
+
 /* Unified table + save footer (mockup: footer pinned to bottom of card) */
 .schedule-save-footer {
   display: flex;
