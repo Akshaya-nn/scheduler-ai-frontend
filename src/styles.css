@@ -61,13 +61,16 @@ body { margin: 0; -webkit-font-smoothing: antialiased; }
 
 /* ─── Card ───────────────────────────────────────────────────────────────── */
 .card {
-  max-width: 980px;
+  width: calc(100vw - 30px);
+  max-width: none;
   margin: 0 auto;
   background: var(--surface-card);
   border-radius: 18px;
   padding: 28px 26px;
   position: relative;
   box-shadow: var(--shadow-lg);
+  min-height: calc(100vh - 30px);
+  min-height: calc(100dvh - 30px);
   /* Color-graded border via outline trick */
   border: 1px solid transparent;
   background-clip: padding-box;
@@ -249,14 +252,52 @@ body { margin: 0; -webkit-font-smoothing: antialiased; }
   display: flex;
   flex-direction: column;
   gap: 12px;
-  min-height: min(700px, 72vh);
-  max-height: min(700px, 74vh);
+  min-height: calc(100vh - 220px);
+  min-height: calc(100dvh - 220px);
+  max-height: calc(100vh - 210px);
+  max-height: calc(100dvh - 210px);
   overflow-y: auto;
   border: 1px solid var(--grey-70);
   border-radius: 14px;
   background: var(--surface-inset);
   padding: 14px 12px;
   scroll-behavior: smooth;
+}
+
+.schedule-compare {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.schedule-compare-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(420px, 1fr));
+  gap: 12px;
+  align-items: stretch;
+  overflow-x: auto;
+  padding-bottom: 4px;
+}
+
+.schedule-compare-card {
+  border: 1px solid var(--grey-70);
+  background: var(--surface-inset);
+  border-radius: 10px;
+  padding: 12px;
+  min-height: 100%;
+}
+
+.schedule-compare-title {
+  margin: 0 0 4px 0;
+  font-size: 0.92rem;
+  font-weight: 700;
+  color: var(--grey-05);
+}
+
+.schedule-compare-meta {
+  margin: 0 0 8px 0;
+  font-size: 0.8rem;
+  color: var(--grey-30);
 }
 
 /* Custom scrollbar */
@@ -358,6 +399,13 @@ body { margin: 0; -webkit-font-smoothing: antialiased; }
 
 .bubble-has-schedule {
   max-width: min(90%, 680px);
+  padding-bottom: 12px;
+}
+
+.bubble-has-compare,
+.bubble-has-compare.bubble {
+  max-width: 100%;
+  width: 100%;
   padding-bottom: 12px;
 }
 
@@ -1109,6 +1157,9 @@ body { margin: 0; -webkit-font-smoothing: antialiased; }
   .card {
     padding: 20px 14px;
     border-radius: 14px;
+    width: 100%;
+    min-height: calc(100vh - 20px);
+    min-height: calc(100dvh - 20px);
   }
 
   .card > h1 {
@@ -1117,10 +1168,15 @@ body { margin: 0; -webkit-font-smoothing: antialiased; }
   }
 
   .chat-thread {
-    min-height: min(420px, calc(100dvh - 240px));
-    max-height: min(480px, calc(100dvh - 210px));
+    min-height: min(520px, calc(100dvh - 250px));
+    max-height: min(620px, calc(100dvh - 220px));
     padding: 10px 8px;
     border-radius: 12px;
+  }
+
+  .schedule-compare-grid {
+    grid-template-columns: 1fr;
+    overflow-x: visible;
   }
 
   .composer {
