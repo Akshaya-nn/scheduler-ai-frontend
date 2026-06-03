@@ -205,6 +205,12 @@ type ChatMessage = {
   showSavePrompt?: boolean;
   /** Inline two-schedule compare card (Option A / B) */
   scheduleOptions?: NonNullable<ApiResponse['scheduleOptions']>;
+  /** Set when user picks A/B — collapses compare to a single option in place */
+  chosenCompareOption?: 'A' | 'B';
+  /** Saved schedule id shown on this bubble after save (in-place, no extra chat line) */
+  bubbleSavedScheduleId?: string;
+  /** Confirmation line after save (e.g. from API assistantMessage) */
+  saveSuccessMessage?: string;
   /** Inline checklist / picker (single assistant bubble ” no duplicate text above) */
   picker?: ChatPicker;
 };
@@ -643,6 +649,68 @@ function scheduleFingerprint(schedule: NonNullable<ApiResponse['schedule']>): st
   });
 }
 
+function findLatestPendingCompareMessage(messages: ChatMessage[]): ChatMessage | undefined {
+  for (let i = messages.length - 1; i >= 0; i -= 1) {
+    const message = messages[i];
+    if (message.role === 'assistant' && message.scheduleOptions && !message.schedule) {
+      return message;
+    }
+  }
+  return undefined;
+}
+
+function resolveChosenCompareOption(
+  choice: 'A' | 'B' | null | undefined,
+  options: NonNullable<ApiResponse['scheduleOptions']>,
+  schedule: NonNullable<ApiResponse['schedule']>,
+): 'A' | 'B' {
+  if (choice === 'A' || choice === 'B') {
+    return choice;
+  }
+  const target = scheduleFingerprint(schedule);
+  if (scheduleFingerprint(options.optionA.schedule) === target) {
+    return 'A';
+  }
+  if (scheduleFingerprint(options.optionB.schedule) === target) {
+    return 'B';
+  }
+  return 'B';
+}
+
+function compareChoiceCaption(
+  options: NonNullable<ApiResponse['scheduleOptions']>,
+  choice: 'A' | 'B',
+  assistantMessage?: string,
+): string {
+  const opt = choice === 'A' ? options.optionA : options.optionB;
+  const doneLine = (assistantMessage ?? '')
+    .split('\n')
+    .map((line) => line.trim())
+    .find((line) => /^done\s[—-]/i.test(line));
+  if (doneLine) {
+    return doneLine;
+  }
+  return `${opt.label} — ${opt.studentCount} students • ${opt.moduleCount} rows • ${opt.rotationCount} rotations`;
+}
+
+function collapseCompareMessageToSchedule(
+  message: ChatMessage,
+  choice: 'A' | 'B',
+  schedule: NonNullable<ApiResponse['schedule']>,
+  assistantMessage?: string,
+): ChatMessage {
+  const options = message.scheduleOptions!;
+  const opt = choice === 'A' ? options.optionA : options.optionB;
+  return {
+    ...message,
+    chosenCompareOption: choice,
+    scheduleOptions: undefined,
+    schedule: schedule ?? opt.schedule,
+    showSavePrompt: true,
+    text: compareChoiceCaption(options, choice, assistantMessage),
+  };
+}
+
 /** Nest interceptor may add statusCode/success/message; some proxies nest the body under `data`. */
 function unwrapAiRotationalPayload(raw: Record<string, unknown>): Record<string, unknown> {
   const nested = raw.data;
@@ -848,6 +916,10 @@ export default function App() {
   const chatThreadRef = useRef<HTMLDivElement>(null);
   /** Skip duplicate schedule cards in chat when the grid unchanged. */
   const lastChatScheduleFingerprintRef = useRef<string | null>(null);
+  /** Tracks A/B click while the compare API round-trip is in flight */
+  const pendingCompareChoiceRef = useRef<'A' | 'B' | null>(null);
+  /** Which chat bubble is currently saving (for per-bubble save button state) */
+  const [savingMessageId, setSavingMessageId] = useState<string | null>(null);
   /** True once the user has reached `completed` with a grid ” used to skip chat auto-scroll during module-edit interrupts. */
   const completedScheduleEverRef = useRef(false);
   /** Avoid double `scrollIntoView` in React Strict Mode for the same bubble. */
@@ -956,28 +1028,57 @@ export default function App() {
     endRotationSelection,
   ]);
 
-  const appendAssistantEntriesFromResponse = useCallback((data: ApiResponse) => {
-    const entries = filterNewScheduleChatEntries(
-      buildAssistantChatEntriesFromResponse(data),
-      lastChatScheduleFingerprintRef,
-    );
-    if (entries.length === 0) {
-      return;
-    }
-    setChatMessages((prev) => {
-      const toAdd: ChatMessage[] = [];
-      for (const entry of entries) {
-        if (
-          entry.picker &&
-          prev.some((m) => m.picker?.kind === entry.picker!.kind && !m.picker.frozen)
-        ) {
-          continue;
+  const appendAssistantEntriesFromResponse = useCallback(
+    (data: ApiResponse, opts?: { compareChoice?: 'A' | 'B' }) => {
+      const grid = pickScheduleFromPayload(data);
+      const step = data.step;
+
+      setChatMessages((prev) => {
+        if (grid && (step === 'completed' || step === 'schedule')) {
+          const compareMessage = findLatestPendingCompareMessage(prev);
+          if (compareMessage?.scheduleOptions) {
+            const choice = resolveChosenCompareOption(
+              opts?.compareChoice ?? compareMessage.chosenCompareOption ?? pendingCompareChoiceRef.current,
+              compareMessage.scheduleOptions,
+              grid,
+            );
+            lastChatScheduleFingerprintRef.current = scheduleFingerprint(grid);
+            pendingCompareChoiceRef.current = null;
+            return prev.map((message) =>
+              message.id === compareMessage.id
+                ? collapseCompareMessageToSchedule(
+                    message,
+                    choice,
+                    grid,
+                    data.assistantMessage ?? undefined,
+                  )
+                : message,
+            );
+          }
         }
-        toAdd.push({ ...entry, id: nextMessageId() });
-      }
-      return toAdd.length > 0 ? [...prev, ...toAdd] : prev;
-    });
-  }, []);
+
+        const entries = filterNewScheduleChatEntries(
+          buildAssistantChatEntriesFromResponse(data),
+          lastChatScheduleFingerprintRef,
+        );
+        if (entries.length === 0) {
+          return prev;
+        }
+        const toAdd: ChatMessage[] = [];
+        for (const entry of entries) {
+          if (
+            entry.picker &&
+            prev.some((m) => m.picker?.kind === entry.picker!.kind && !m.picker.frozen)
+          ) {
+            continue;
+          }
+          toAdd.push({ ...entry, id: nextMessageId() });
+        }
+        return toAdd.length > 0 ? [...prev, ...toAdd] : prev;
+      });
+    },
+    [],
+  );
 
   const freezePickerInChat = useCallback((kind: ChatPicker['kind'], finalize: (picker: ChatPicker) => ChatPicker) => {
     setChatMessages((prev) =>
@@ -1124,11 +1225,24 @@ export default function App() {
     !savingSchedule &&
     !savedScheduleId;
 
-  function handleSaveScheduleNo() {
-    appendMessages([{ role: 'assistant', text: 'OK — tell me if you want any other changes.' }]);
+  function handleSaveScheduleNo(chatMessageId: string) {
+    setChatMessages((prev) =>
+      prev.map((message) =>
+        message.id === chatMessageId
+          ? {
+              ...message,
+              showSavePrompt: false,
+              text: 'OK — tell me if you want any other changes.',
+            }
+          : message,
+      ),
+    );
   }
 
-  async function saveCurrentSchedule(targetSessionId: string) {
+  async function saveCurrentSchedule(targetSessionId: string, chatMessageId?: string) {
+    if (chatMessageId) {
+      setSavingMessageId(chatMessageId);
+    }
     setSavingSchedule(true);
     setError('');
     try {
@@ -1153,14 +1267,29 @@ export default function App() {
       }
       const scheduleId =
         typeof unwrapped.scheduleId === 'string' ? unwrapped.scheduleId : '';
+      const saveSuccessMessage =
+        typeof unwrapped.assistantMessage === 'string' && unwrapped.assistantMessage.trim()
+          ? unwrapped.assistantMessage.trim()
+          : 'Schedule saved successfully.';
       if (scheduleId) {
         setSavedScheduleId(scheduleId);
       }
-      const assistantMessage =
-        typeof unwrapped.assistantMessage === 'string'
-          ? unwrapped.assistantMessage
-          : 'Schedule saved successfully.';
-      appendMessages([{ role: 'assistant', text: assistantMessage }]);
+      if (chatMessageId) {
+        setChatMessages((prev) =>
+          prev.map((message) =>
+            message.id === chatMessageId
+              ? {
+                  ...message,
+                  showSavePrompt: false,
+                  ...(scheduleId ? { bubbleSavedScheduleId: scheduleId } : {}),
+                  saveSuccessMessage,
+                }
+              : message,
+          ),
+        );
+      } else {
+        appendMessages([{ role: 'assistant', text: saveSuccessMessage }]);
+      }
     } catch (e) {
       const msg =
         e instanceof Error && e.name === 'AbortError'
@@ -1172,6 +1301,7 @@ export default function App() {
       appendMessages([{ role: 'assistant', text: `Something went wrong: ${msg}`, isError: true }]);
     } finally {
       setSavingSchedule(false);
+      setSavingMessageId(null);
     }
   }
 
@@ -1270,7 +1400,9 @@ export default function App() {
       const merged = mergePartialAiResponse(response, unwrapped);
       setResponse(merged);
       setPersistedSchedule((prev) => mergePersistedSchedule(merged, prev));
-      appendAssistantEntriesFromResponse(merged);
+      appendAssistantEntriesFromResponse(merged, {
+        compareChoice: pendingCompareChoiceRef.current ?? undefined,
+      });
     } catch (err) {
       setError((err as Error).message);
       appendMessages([{ role: 'assistant', text: `Something went wrong: ${(err as Error).message}`, isError: true }]);
@@ -1797,6 +1929,16 @@ export default function App() {
     return null;
   }
 
+  function chooseCompareOption(messageId: string, choice: 'A' | 'B') {
+    pendingCompareChoiceRef.current = choice;
+    setChatMessages((prev) =>
+      prev.map((message) =>
+        message.id === messageId ? { ...message, chosenCompareOption: choice } : message,
+      ),
+    );
+    void sendMessage(`Option ${choice}`);
+  }
+
   function renderMessageBody(message: ChatMessage) {
     if (message.role === 'user') {
       if (message.heading || (message.items && message.items.length > 0)) {
@@ -1820,27 +1962,51 @@ export default function App() {
       return null;
     }
     if (message.schedule) {
+      const showSave = message.showSavePrompt && !message.bubbleSavedScheduleId;
       return (
         <div className="schedule-in-chat">
           {message.text && <p className="bubble-text bubble-text-tight">{message.text}</p>}
           <ScheduleGridTable
             schedule={message.schedule}
-            scrollable={!message.showSavePrompt}
+            scrollable={!showSave}
             savePrompt={
-              message.showSavePrompt && !savedScheduleId
+              showSave
                 ? {
-                    onNo: handleSaveScheduleNo,
-                    onYes: () => void saveCurrentSchedule(sessionId),
-                    saving: savingSchedule,
+                    onNo: () => handleSaveScheduleNo(message.id),
+                    onYes: () => void saveCurrentSchedule(sessionId, message.id),
+                    saving: savingSchedule && savingMessageId === message.id,
                   }
                 : undefined
             }
           />
+          {message.saveSuccessMessage && (
+            <footer className="schedule-save-footer schedule-save-footer-inline">
+              <p className="schedule-save-status">{message.saveSuccessMessage}</p>
+            </footer>
+          )}
         </div>
       );
     }
     if (message.scheduleOptions) {
       const options = message.scheduleOptions;
+      const chosen = message.chosenCompareOption;
+
+      if (chosen) {
+        const chosenOption = chosen === 'A' ? options.optionA : options.optionB;
+        return (
+          <div className="schedule-compare schedule-compare-chosen">
+            <div className="schedule-compare-card schedule-compare-card-chosen">
+              <h3 className="schedule-compare-title">{chosenOption.label}</h3>
+              <p className="schedule-compare-meta">
+                {chosenOption.studentCount} students • {chosenOption.moduleCount} rows •{' '}
+                {chosenOption.rotationCount} rotations
+              </p>
+              <ScheduleGridTable schedule={chosenOption.schedule} scrollable />
+            </div>
+          </div>
+        );
+      }
+
       return (
         <div className="schedule-compare">
           {message.text?.trim() && <p className="bubble-text bubble-text-tight">{message.text}</p>}
@@ -1848,7 +2014,8 @@ export default function App() {
             <div className="schedule-compare-card">
               <h3 className="schedule-compare-title">{options.optionA.label}</h3>
               <p className="schedule-compare-meta">
-                {options.optionA.studentCount} students • {options.optionA.moduleCount} rows • {options.optionA.rotationCount} rotations
+                {options.optionA.studentCount} students • {options.optionA.moduleCount} rows •{' '}
+                {options.optionA.rotationCount} rotations
               </p>
               <ScheduleGridTable schedule={options.optionA.schedule} scrollable />
               <div className="bubble-actions">
@@ -1856,10 +2023,7 @@ export default function App() {
                   className="btn primary"
                   type="button"
                   disabled={loading}
-                  onClick={() => {
-                    appendUserText('Option A');
-                    void sendMessage('Option A');
-                  }}
+                  onClick={() => chooseCompareOption(message.id, 'A')}
                 >
                   Choose Option A
                 </button>
@@ -1868,7 +2032,8 @@ export default function App() {
             <div className="schedule-compare-card">
               <h3 className="schedule-compare-title">{options.optionB.label}</h3>
               <p className="schedule-compare-meta">
-                {options.optionB.studentCount} students • {options.optionB.moduleCount} rows • {options.optionB.rotationCount} rotations
+                {options.optionB.studentCount} students • {options.optionB.moduleCount} rows •{' '}
+                {options.optionB.rotationCount} rotations
               </p>
               <ScheduleGridTable schedule={options.optionB.schedule} scrollable />
               <div className="bubble-actions">
@@ -1876,10 +2041,7 @@ export default function App() {
                   className="btn primary"
                   type="button"
                   disabled={loading}
-                  onClick={() => {
-                    appendUserText('Option B');
-                    void sendMessage('Option B');
-                  }}
+                  onClick={() => chooseCompareOption(message.id, 'B')}
                 >
                   Choose Option B
                 </button>
@@ -1921,15 +2083,16 @@ export default function App() {
             if (!body) {
               return null;
             }
+            const isDualCompare = Boolean(message.scheduleOptions && !message.chosenCompareOption);
             return (
               <div
                 key={message.id}
                 id={`chat-msg-${message.id}`}
-                className={`msg-row ${message.role === 'user' ? 'msg-row-user' : 'msg-row-assistant'}${message.isError ? ' msg-row-error' : ''}`}
+                className={`msg-row ${message.role === 'user' ? 'msg-row-user' : 'msg-row-assistant'}${message.isError ? ' msg-row-error' : ''}${isDualCompare ? ' msg-row-wide' : ''}`}
               >
                 <div className="msg-meta">{message.role === 'user' ? 'You' : 'Assistant'}</div>
                 <div
-                  className={`bubble ${message.role === 'user' ? 'bubble-user' : 'bubble-assistant'}${message.schedule ? ' bubble-has-schedule' : ''}${message.scheduleOptions ? ' bubble-has-compare' : ''}${message.picker ? ' bubble-embed' : ''}`}
+                  className={`bubble ${message.role === 'user' ? 'bubble-user' : 'bubble-assistant'}${message.schedule ? ' bubble-has-schedule' : ''}${isDualCompare ? ' bubble-has-compare' : ''}${message.picker ? ' bubble-embed' : ''}`}
                 >
                   {body}
                 </div>
