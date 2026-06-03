@@ -1188,6 +1188,19 @@ export default function App() {
     studentIds: string[];
   };
 
+type StudentAssignCheckResponse = {
+  moduleList?: Array<{
+    moduleId: string;
+    moduleName?: string;
+    student?: Array<{ id: string; fullName: string }>;
+  }>;
+};
+
+type DropdownStudentListResponse = {
+  studentList?: Array<{ id: string; studentName?: string }>;
+  message?: string;
+};
+
   /** POST session/message body — module/student picks use structured fields, not `message`. */
   function buildSessionMessageBody(
     activeSessionId: string,
@@ -1241,6 +1254,47 @@ export default function App() {
     } finally {
       setLoading(false);
     }
+  }
+
+  async function checkAssignedStudentsBeforeModuleConfirm(params: {
+    classId: string;
+    moduleIds: string[];
+    studentIds: string[];
+  }): Promise<StudentAssignCheckResponse> {
+    const res = await fetch(`${apiBase}/ai-rotational/student/assign/check`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        classId: params.classId,
+        scheduleId: '',
+        moduleIds: params.moduleIds,
+        studentIds: params.studentIds,
+      }),
+    });
+    const data = (await res.json()) as StudentAssignCheckResponse & { message?: string };
+    if (!res.ok) {
+      throw new Error(data.message ?? 'student/assign/check failed');
+    }
+    return data;
+  }
+
+  async function fetchAllClassStudentIds(classId: string): Promise<string[]> {
+    const res = await fetch(`${apiBase}/dropdown/student/list`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ classId }),
+    });
+    const data = (await res.json()) as DropdownStudentListResponse;
+    if (!res.ok) {
+      throw new Error(data.message ?? 'Failed to load class students');
+    }
+    return Array.from(
+      new Set(
+        (data.studentList ?? [])
+          .map((row) => (typeof row.id === 'string' ? row.id.trim() : ''))
+          .filter((id) => id.length > 0),
+      ),
+    );
   }
 
   function archiveCurrentScheduleAndResetForNewFlow(triggerMessage: string): boolean {
@@ -1382,9 +1436,61 @@ export default function App() {
     if (!response || response.step !== 'modules') return;
     if (loading) return;
     if (moduleSelection.length === 0) return;
+    if (!currentClassId) return;
+    const selectedStudentIds = Array.from(
+      new Set(
+        [
+          ...(response.selectedStudents ?? []).map((s) => s.id),
+          ...studentSelection,
+          ...(response.students ?? []).map((s) => s.id),
+        ].filter((id) => typeof id === 'string' && id.trim().length > 0),
+      ),
+    );
+    let studentIdsForCheck = selectedStudentIds;
+    if (studentIdsForCheck.length === 0) {
+      try {
+        studentIdsForCheck = await fetchAllClassStudentIds(currentClassId);
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : 'Failed to load class students';
+        setError(msg);
+        appendMessages([{ role: 'assistant', text: `Something went wrong: ${msg}`, isError: true }]);
+        return;
+      }
+    }
+    if (studentIdsForCheck.length === 0) {
+      appendMessages([{ role: 'assistant', text: 'No students available for this class.', isError: true }]);
+      return;
+    }
+    const moduleIds = [...new Set(moduleSelection.map((id) => catalogIdFromExpandedModuleRowId(id)))];
     const names = moduleSelection
       .map((id) => response.modules.find((m) => m.id === id)?.name ?? id)
       .filter(Boolean);
+    try {
+      const assignCheck = await checkAssignedStudentsBeforeModuleConfirm({
+        classId: currentClassId,
+        moduleIds,
+        studentIds: studentIdsForCheck,
+      });
+      const assignedRows = assignCheck.moduleList ?? [];
+      if (assignedRows.length > 0) {
+        const preview = assignedRows
+          .slice(0, 4)
+          .map((row) => {
+            const studentNames = (row.student ?? [])
+              .map((s) => s.fullName)
+              .filter((n) => n.trim().length > 0)
+              .slice(0, 4)
+              .join(', ');
+            return `${row.moduleName ?? row.moduleId}: ${studentNames}`;
+          })
+          .join(' | ');
+      }
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : 'student/assign/check failed';
+      setError(msg);
+      appendMessages([{ role: 'assistant', text: `Something went wrong: ${msg}`, isError: true }]);
+      return;
+    }
     freezePickerInChat('modules', (p) =>
       p.kind === 'modules'
         ? {
