@@ -1,5 +1,9 @@
 import { FormEvent, Fragment, useCallback, useEffect, useRef, useState } from 'react';
-import { resolveConversationalReply } from './conversational-message';
+import {
+  isUsageHelpMessage,
+  resolveConversationalReply,
+  USAGE_HELP_ASSISTANT_REPLY,
+} from './conversational-message';
 import { ScheduleFullPageRoute } from './ScheduleFullPage';
 import {
   closeScheduleFullView,
@@ -1535,7 +1539,9 @@ export default function App() {
           appendMessages([
             {
               role: 'assistant',
-              text: 'I can help with rotational schedule creation. Please ask to create a rotational schedule.',
+              text: isUsageHelpMessage(message)
+                ? USAGE_HELP_ASSISTANT_REPLY
+                : 'I help with rotational schedules for your class. Ask how to use this AI for a walkthrough.',
             },
           ]);
           return;

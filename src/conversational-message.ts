@@ -37,6 +37,54 @@ const TIME_OF_DAY_GREETING_REPLIES: ReadonlyArray<{
 
 export const THANK_YOU_ASSISTANT_REPLY = "You're welcome!";
 
+/** Keep in sync with backend conversational-message.ts */
+export const USAGE_HELP_ASSISTANT_REPLY =
+  'I am the AI Rotational Scheduler. I help you build and update class rotation grids using chat and the panels under each message.\n\n' +
+  'How it works:\n' +
+  '1. Select a schedule type using the list in chat, then tap Confirm selection. You can also reply with the name or number.\n' +
+  '2. Next you will see the modules for that type. Choose the modules you want and confirm. All students in the class are selected at first; you can change the student list later if needed.\n' +
+  '3. To edit an existing schedule, tell me what to add, remove, delete, or update (students, modules, rotations, copy rows). I will regenerate the grid to match.\n' +
+  '4. When you are satisfied, save the schedule from the UI to apply it to your class.\n\n' +
+  'The student list, module catalog, and schedule table are shown in the panels below the chat so you usually pick there instead of typing long lists.';
+
+const USAGE_HELP_PATTERNS: RegExp[] = [
+  /\bhow\s+(?:do|can|does|to)\s+(?:(?:i|we|you)\s+)?use\b/,
+  /\bhow\s+to\s+use\b/,
+  /\bhow\s+(?:do|can)\s+(?:i|we)\s+(?:get\s+started|begin|start)\b/,
+  /\bhow\s+(?:does|do)\s+(?:this|the|it)\s+(?:ai\s+)?(?:scheduler|schedular)?\b/,
+  /\bhow\s+(?:does|do)\s+(?:this|it)\s+(?:ai\s+)?work\b/,
+  /\bwhat\s+can\s+(?:you|this|the\s+ai)\s+do\b/,
+  /\bwhat\s+is\s+this\s+(?:ai\s+)?(?:scheduler|schedular)\b/,
+  /\bhelp\s+me\s+(?:use|understand|with)\b/,
+  /\b(?:guide|tutorial|instructions|getting\s+started)\b/,
+  /\bexplain\s+(?:how|what|this)\b/,
+  /\btell\s+me\s+how\b/,
+];
+
+export function isUsageHelpMessage(message: string): boolean {
+  const normalized = normalizeConversationalMessage(message);
+  if (!normalized) {
+    return false;
+  }
+  if (/\b(?:remove|drop|delete|add|include|generate|build|make)\b/.test(normalized)) {
+    return false;
+  }
+  if (/\b(?:first|last)\s+\d+\b/.test(normalized)) {
+    return false;
+  }
+  if (USAGE_HELP_PATTERNS.some((pattern) => pattern.test(normalized))) {
+    return true;
+  }
+  if (
+    /\bhow\b/.test(normalized) &&
+    /\b(?:use|works?|work)\b/.test(normalized) &&
+    /\b(?:ai|scheduler|schedular|this)\b/.test(normalized)
+  ) {
+    return true;
+  }
+  return false;
+}
+
 export function normalizeConversationalMessage(message: string): string {
   return message
     .trim()
@@ -127,6 +175,9 @@ export function buildGreetingAssistantReply(message: string): string {
 export function resolveConversationalReply(message: string): string | null {
   if (isThankYouMessage(message)) {
     return THANK_YOU_ASSISTANT_REPLY;
+  }
+  if (isUsageHelpMessage(message)) {
+    return USAGE_HELP_ASSISTANT_REPLY;
   }
   if (isGreetingMessage(message)) {
     return buildGreetingAssistantReply(message);
