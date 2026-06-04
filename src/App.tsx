@@ -539,7 +539,8 @@ function buildAssistantChatEntriesFromResponse(data: ApiResponse): Omit<ChatMess
   }));
 }
 
-const EXISTING_ASSIGNMENTS_MESSAGE_PREFIX = 'Found existing assignments';
+const EXISTING_ASSIGNMENTS_MESSAGE_PREFIX =
+  'Some students are already assigned in the same modules';
 
 function splitDoneAndAssignCheckNotice(assistantMessage: string): {
   doneText: string;
@@ -792,40 +793,6 @@ function mergePersistedSchedule(data: ApiResponse, previous: ApiResponse['schedu
 /** Copy rows expand `selectedModules` with synthetic suffixes; checklist rows use catalog ids. */
 function catalogIdFromExpandedModuleRowId(id: string): string {
   return id.replace(/::__copy_\d+(?:_\d+)?$/i, '');
-}
-
-function normalizeModuleCatalogIds(ids: string[]): string[] {
-  return Array.from(new Set(ids.map((id) => catalogIdFromExpandedModuleRowId(id.trim())).filter((id) => id.length > 0)));
-}
-
-function resolveModuleCatalogIdsForAssignCheck(
-  resp: ApiResponse | null,
-  modulePayloadIds?: string[],
-): string[] {
-  if (modulePayloadIds && modulePayloadIds.length > 0) {
-    return normalizeModuleCatalogIds(modulePayloadIds);
-  }
-  if ((resp?.selectedModules?.length ?? 0) > 0) {
-    return normalizeModuleCatalogIds((resp?.selectedModules ?? []).map((module) => module.id));
-  }
-  return [];
-}
-
-/** Call `student/assign/check` before turns that can generate or regenerate the grid. */
-function shouldRunAssignCheckBeforeSend(
-  payload: string | { moduleIds: string[] } | { studentIds: string[] },
-  moduleCatalogIds: string[],
-): boolean {
-  if (moduleCatalogIds.length === 0) {
-    return false;
-  }
-  if (typeof payload !== 'string' && 'moduleIds' in payload) {
-    return true;
-  }
-  if (typeof payload === 'string') {
-    return /start rotation exactly/i.test(payload) || /end rotation exactly/i.test(payload);
-  }
-  return false;
 }
 
 function ScheduleGridTable({
@@ -1419,36 +1386,6 @@ export default function App() {
     studentIds: string[];
   };
 
-  type StudentAssignCheckResponse = {
-    moduleList?: Array<{
-      moduleId: string;
-      moduleName?: string;
-      student?: Array<{ id: string; fullName: string }>;
-    }>;
-  };
-
-  async function checkAssignedStudentsBeforeModuleConfirm(params: {
-    classId: string;
-    moduleIds: string[];
-    studentIds: string[];
-  }): Promise<StudentAssignCheckResponse> {
-    const res = await fetch(`${apiBase}/ai-rotational/student/assign/check`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        classId: params.classId,
-        scheduleId: '',
-        moduleIds: params.moduleIds,
-        studentIds: params.studentIds,
-      }),
-    });
-    const data = (await res.json()) as StudentAssignCheckResponse & { message?: string };
-    if (!res.ok) {
-      throw new Error(data.message ?? 'student/assign/check failed');
-    }
-    return data;
-  }
-
   /** POST session/message body — module/student picks use structured fields, not `message`. */
   function buildSessionMessageBody(
     activeSessionId: string,
@@ -1484,29 +1421,9 @@ export default function App() {
       studentRosterTouchedRef.current = true;
     }
 
-    const moduleCatalogIds = resolveModuleCatalogIdsForAssignCheck(
-      response,
-      typeof payload !== 'string' && 'moduleIds' in payload ? payload.moduleIds : undefined,
-    );
-    const needsAssignCheck = shouldRunAssignCheckBeforeSend(payload, moduleCatalogIds);
-
     setLoading(true);
     setError('');
     try {
-      if (needsAssignCheck && currentClassId) {
-        try {
-          await checkAssignedStudentsBeforeModuleConfirm({
-            classId: currentClassId,
-            moduleIds: moduleCatalogIds,
-            studentIds: assignCheckStudentIdsRef.current,
-          });
-        } catch (err) {
-          const msg = err instanceof Error ? err.message : 'student/assign/check failed';
-          setError(msg);
-          appendMessages([{ role: 'assistant', text: `Something went wrong: ${msg}`, isError: true }]);
-          return false;
-        }
-      }
       const body = buildSessionMessageBody(activeSessionId, payload);
       const res = await fetch(`${apiBase}/ai-rotational/session/message`, {
         method: 'POST',
