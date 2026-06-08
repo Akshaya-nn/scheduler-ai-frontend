@@ -66,6 +66,8 @@ type ApiResponse = {
   sessionId: string;
   step: ResponseStep;
   assistantMessage: string;
+  /** Set after `POST session/save` succeeds. */
+  scheduleId?: string;
   rotationRangeMax?: number;
   students: Student[];
   modules: ModuleItem[];
@@ -420,7 +422,7 @@ function buildAssistantChatEntriesFromResponse(data: ApiResponse): Omit<ChatMess
   const grid = pickScheduleFromPayload(data);
   const step = data.step;
 
-  if (grid && (step === 'completed' || step === 'schedule')) {
+  if (grid && step === 'schedule') {
     const { doneText, assignCheckNotice } = splitDoneAndAssignCheckNotice(raw);
     return [
       {
@@ -572,8 +574,30 @@ function isScheduleDoneAckText(text?: string): boolean {
   return /\bDone\b/i.test(text) || /\bschedule updated\b/i.test(text);
 }
 
+/** Server sent a fresh grid this turn — render schedule bubble + Save. */
 function isScheduleGenerationStep(step: ApiResponse['step'] | undefined): boolean {
-  return step === 'completed' || step === 'schedule';
+  return step === 'schedule';
+}
+
+/** Post-generation workflow: grid exists; edits and save are allowed. */
+function isPostGenerationWorkflowStep(step: ApiResponse['step'] | undefined): boolean {
+  return step === 'schedule' || step === 'completed';
+}
+
+/** Keep the last grid in client state when the server omits `schedule` on interrupt/chat turns. */
+function shouldRetainPersistedSchedule(step: ApiResponse['step'] | undefined): boolean {
+  return (
+    step === 'schedule' ||
+    step === 'completed' ||
+    step === 'assistantMessage' ||
+    step === 'modules' ||
+    step === 'schedule_types' ||
+    step === 'students' ||
+    step === 'rotation_count' ||
+    step === 'rotation_capacity' ||
+    step === 'pairing' ||
+    step === 'generic'
+  );
 }
 
 function filterNewScheduleChatEntries(
@@ -784,13 +808,7 @@ function mergePersistedSchedule(data: ApiResponse, previous: ApiResponse['schedu
   if (picked !== null) {
     return picked;
   }
-  if (
-    data.step === 'completed' ||
-    data.step === 'schedule' ||
-    data.step === 'modules' ||
-    data.step === 'schedule_types' ||
-    data.step === 'students'
-  ) {
+  if (shouldRetainPersistedSchedule(data.step)) {
     return previous;
   }
   return null;
@@ -835,6 +853,96 @@ function shouldRunAssignCheckBeforeSend(
   return false;
 }
 
+type SaveModalRequest = {
+  sessionId: string;
+  chatMessageId?: string;
+};
+
+function ScheduleSaveModal({
+  scheduleName,
+  saving,
+  onScheduleNameChange,
+  onCancel,
+  onConfirm,
+}: {
+  scheduleName: string;
+  saving: boolean;
+  onScheduleNameChange: (value: string) => void;
+  onCancel: () => void;
+  onConfirm: () => void;
+}) {
+  const inputRef = useRef<HTMLInputElement>(null);
+
+  useEffect(() => {
+    const previousOverflow = document.body.style.overflow;
+    document.body.style.overflow = 'hidden';
+    inputRef.current?.focus();
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.key === 'Escape' && !saving) {
+        onCancel();
+      }
+    };
+    window.addEventListener('keydown', onKeyDown);
+    return () => {
+      document.body.style.overflow = previousOverflow;
+      window.removeEventListener('keydown', onKeyDown);
+    };
+  }, [onCancel, saving]);
+
+  const canConfirm = scheduleName.trim().length > 0 && !saving;
+
+  return (
+    <div className="schedule-save-modal-overlay" role="presentation">
+      <button
+        type="button"
+        className="schedule-save-modal-backdrop"
+        aria-label="Close save dialog"
+        disabled={saving}
+        onClick={onCancel}
+      />
+      <div
+        className="schedule-save-modal"
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby="schedule-save-modal-title"
+      >
+        <h2 id="schedule-save-modal-title" className="schedule-save-modal-title">
+          Save schedule
+        </h2>
+        <p className="schedule-save-modal-text">Enter a name for this schedule in Star Academy.</p>
+        <label className="schedule-save-modal-label" htmlFor="schedule-save-name-input">
+          Schedule name
+        </label>
+        <input
+          ref={inputRef}
+          id="schedule-save-name-input"
+          className="input schedule-save-modal-input"
+          type="text"
+          value={scheduleName}
+          maxLength={120}
+          placeholder="e.g. Science Block A — Spring 2026"
+          disabled={saving}
+          onChange={(event) => onScheduleNameChange(event.target.value)}
+          onKeyDown={(event) => {
+            if (event.key === 'Enter' && canConfirm) {
+              event.preventDefault();
+              onConfirm();
+            }
+          }}
+        />
+        <div className="schedule-save-modal-actions">
+          <button className="btn btn-outline" type="button" disabled={saving} onClick={onCancel}>
+            Cancel
+          </button>
+          <button className="btn primary" type="button" disabled={!canConfirm} onClick={onConfirm}>
+            {saving ? 'Saving…' : 'Confirm'}
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
 function ScheduleGridTable({
   schedule,
   scrollable = false,
@@ -844,7 +952,7 @@ function ScheduleGridTable({
 }: {
   schedule: NonNullable<ApiResponse['schedule']>;
   scrollable?: boolean;
-  savePrompt?: { onYes: () => void; onNo: () => void; saving?: boolean };
+  savePrompt?: { onSave: () => void; saving?: boolean };
   /** Inline compact view only — opens dedicated full-page view (not an overlay). */
   showExpandControl?: boolean;
   expandTitle?: string;
@@ -923,15 +1031,14 @@ function ScheduleGridTable({
       {compactToolbar}
       <div className="schedule-table-wrap schedule-table-wrap--scroll">{table}</div>
       <footer className="schedule-save-prompt">
-        <p className="schedule-save-prompt-text">Would you like to save this schedule?</p>
-        <div className="schedule-save-actions">
-          <button className="btn btn-outline" type="button" disabled={savePrompt.saving} onClick={savePrompt.onNo}>
-            No
-          </button>
-          <button className="btn primary" type="button" disabled={savePrompt.saving} onClick={savePrompt.onYes}>
-            {savePrompt.saving ? 'Saving…' : 'Yes, save'}
-          </button>
-        </div>
+        <button
+          className="btn btn-save-schedule"
+          type="button"
+          disabled={savePrompt.saving}
+          onClick={savePrompt.onSave}
+        >
+          {savePrompt.saving ? 'Saving…' : 'Save'}
+        </button>
       </footer>
     </div>
   );
@@ -1005,6 +1112,8 @@ export default function App() {
   const pendingCompareChoiceRef = useRef<'A' | 'B' | null>(null);
   /** Which chat bubble is currently saving (for per-bubble save button state) */
   const [savingMessageId, setSavingMessageId] = useState<string | null>(null);
+  const [saveModalRequest, setSaveModalRequest] = useState<SaveModalRequest | null>(null);
+  const [saveModalScheduleName, setSaveModalScheduleName] = useState('');
   /** True once the user has reached `completed` with a grid ” used to skip chat auto-scroll during module-edit interrupts. */
   const completedScheduleEverRef = useRef(false);
   /** Avoid double `scrollIntoView` in React Strict Mode for the same bubble. */
@@ -1324,11 +1433,7 @@ export default function App() {
   /** Keep showing the last grid when reopening module/student pick after `completed` (API may omit `schedule` on interrupt steps). */
   const displaySchedule =
     normalizedSchedule ??
-    (response?.step === 'completed' ||
-    response?.step === 'modules' ||
-    response?.step === 'schedule_types' ||
-    response?.step === 'students' ||
-    (response != null && isRotationRangeEditResponse(response))
+    (response && (shouldRetainPersistedSchedule(response.step) || isRotationRangeEditResponse(response))
       ? persistedSchedule
       : null);
 
@@ -1339,7 +1444,7 @@ export default function App() {
     if (!response || response.sessionId !== sessionId) {
       return;
     }
-    if (response.step !== 'completed') {
+    if (!isPostGenerationWorkflowStep(response.step) && response.step !== 'assistantMessage') {
       return;
     }
     const grid = normalizedSchedule ?? persistedSchedule;
@@ -1359,31 +1464,40 @@ export default function App() {
 
   const canSend = chatInput.trim().length > 0 && !loading && !sharedSessionLoading;
 
-  const scheduleStepShowsGrid =
-    response?.step === 'schedule' || response?.step === 'completed';
-
   const canSaveCurrentSchedule =
     Boolean(sessionId) &&
-    scheduleStepShowsGrid &&
+    isPostGenerationWorkflowStep(response?.step) &&
     displaySchedule != null &&
     !savingSchedule &&
-    !savedScheduleId;
+    !savedScheduleId &&
+    !response?.scheduleId;
 
-  function handleSaveScheduleNo(chatMessageId: string) {
-    setChatMessages((prev) =>
-      prev.map((message) =>
-        message.id === chatMessageId
-          ? {
-              ...message,
-              showSavePrompt: false,
-              text: 'OK — tell me if you want any other changes.',
-            }
-          : message,
-      ),
-    );
+  function defaultSaveScheduleName(): string {
+    const typeName = response?.selectedScheduleType?.name?.trim();
+    if (typeName) {
+      return typeName;
+    }
+    return '';
   }
 
-  async function saveCurrentSchedule(targetSessionId: string, chatMessageId?: string) {
+  function openSaveScheduleModal(targetSessionId: string, chatMessageId?: string) {
+    setSaveModalScheduleName(defaultSaveScheduleName());
+    setSaveModalRequest({ sessionId: targetSessionId, chatMessageId });
+  }
+
+  function closeSaveScheduleModal() {
+    if (savingSchedule) {
+      return;
+    }
+    setSaveModalRequest(null);
+    setSaveModalScheduleName('');
+  }
+
+  async function saveCurrentSchedule(
+    targetSessionId: string,
+    chatMessageId?: string,
+    scheduleName?: string,
+  ) {
     if (chatMessageId) {
       setSavingMessageId(chatMessageId);
     }
@@ -1396,7 +1510,10 @@ export default function App() {
       const res = await fetch(`${apiBase}/ai-rotational/session/save`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ sessionId: targetSessionId }),
+        body: JSON.stringify({
+          sessionId: targetSessionId,
+          ...(scheduleName?.trim() ? { scheduleName: scheduleName.trim() } : {}),
+        }),
         signal: controller.signal,
       });
       window.clearTimeout(timeoutId);
@@ -1418,6 +1535,16 @@ export default function App() {
       if (scheduleId) {
         setSavedScheduleId(scheduleId);
       }
+      setResponse((prev) =>
+        prev
+          ? mergePartialAiResponse(prev, {
+              step: 'completed',
+              assistantMessage: saveSuccessMessage,
+              schedule: null,
+              ...(scheduleId ? { scheduleId } : {}),
+            })
+          : null,
+      );
       if (chatMessageId) {
         setChatMessages((prev) =>
           prev.map((message) =>
@@ -1446,7 +1573,20 @@ export default function App() {
     } finally {
       setSavingSchedule(false);
       setSavingMessageId(null);
+      setSaveModalRequest(null);
+      setSaveModalScheduleName('');
     }
+  }
+
+  function confirmSaveScheduleModal() {
+    if (!saveModalRequest) {
+      return;
+    }
+    const trimmedName = saveModalScheduleName.trim();
+    if (!trimmedName) {
+      return;
+    }
+    void saveCurrentSchedule(saveModalRequest.sessionId, saveModalRequest.chatMessageId, trimmedName);
   }
 
   async function startSession(classId: string, initialMessage?: string) {
@@ -1670,7 +1810,11 @@ export default function App() {
      * "new rotational schedule" as a shortcut that resets the session and asks for a fresh class ID.
      * Inline class IDs in the same message are honored so the user can skip the prompt.
      */
-    if (sessionId && response?.step === 'completed' && isCreateNewScheduleIntent(message)) {
+    if (
+      sessionId &&
+      (isPostGenerationWorkflowStep(response?.step) || completedScheduleEverRef.current) &&
+      isCreateNewScheduleIntent(message)
+    ) {
       const inlineClassId = extractClassIdFromMessage(message);
       const handled = archiveCurrentScheduleAndResetForNewFlow(message);
       if (handled && inlineClassId) {
@@ -2184,8 +2328,7 @@ export default function App() {
             savePrompt={
               showSave
                 ? {
-                    onNo: () => handleSaveScheduleNo(message.id),
-                    onYes: () => void saveCurrentSchedule(sessionId, message.id),
+                    onSave: () => openSaveScheduleModal(sessionId, message.id),
                     saving: savingSchedule && savingMessageId === message.id,
                   }
                 : undefined
@@ -2420,9 +2563,9 @@ export default function App() {
                     type="button"
                     className="btn btn-save-schedule"
                     disabled={savingSchedule}
-                    onClick={() => void saveCurrentSchedule(entry.sessionId)}
+                    onClick={() => openSaveScheduleModal(entry.sessionId)}
                   >
-                    {savingSchedule ? 'Saving…' : 'Yes, save'}
+                    {savingSchedule ? 'Saving…' : 'Save'}
                   </button>
                 )}
               </footer>
@@ -2431,6 +2574,16 @@ export default function App() {
         ))}
 
       </section>
+
+      {saveModalRequest && (
+        <ScheduleSaveModal
+          scheduleName={saveModalScheduleName}
+          saving={savingSchedule}
+          onScheduleNameChange={setSaveModalScheduleName}
+          onCancel={closeSaveScheduleModal}
+          onConfirm={confirmSaveScheduleModal}
+        />
+      )}
     </main>
   );
 }
