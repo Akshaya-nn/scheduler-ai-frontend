@@ -206,6 +206,33 @@ body { margin: 0; -webkit-font-smoothing: antialiased; }
   margin-top: 8px;
 }
 
+.session-share-bar {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+  margin: 0 0 12px;
+  padding: 8px 12px;
+  border-radius: 8px;
+  background: rgba(255, 255, 255, 0.04);
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  font-size: 0.85rem;
+}
+
+.session-share-id {
+  font-size: 0.8rem;
+  word-break: break-all;
+}
+
+.session-share-hint {
+  color: rgba(255, 255, 255, 0.55);
+}
+
+.btn-sm {
+  padding: 4px 10px;
+  font-size: 0.8rem;
+}
+
 /* ─── Warning ────────────────────────────────────────────────────────────── */
 .warning {
   background: rgba(161, 98, 7, 0.1);
