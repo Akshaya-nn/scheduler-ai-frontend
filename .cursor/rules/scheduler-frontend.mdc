@@ -1,0 +1,82 @@
+---
+description: Scheduler AI frontend — App.tsx session client, steps, save modal, merge rules
+globs: src/**
+alwaysApply: false
+---
+
+# Scheduler AI frontend (`scheduler-ai-frontend`)
+
+Backend contract: `star-academy-ai-scheduler/docs/session-contract.md`.
+
+API base: `VITE_AI_API_BASE` (default `http://localhost:8080/v2`).
+
+## Main file
+
+`src/App.tsx` — session state, chat timeline, inline pickers, schedule grids, save modal.
+
+## API calls
+
+| Action | Endpoint |
+|--------|----------|
+| Start / message | `POST /ai-rotational/session/message` (with or without `sessionId`) |
+| Save | `POST /ai-rotational/session/save` `{ sessionId, scheduleName }` |
+| History | `POST /ai-rotational/session/history` `{ sessionId }` — `fetchSessionChatHistory` |
+| Assign check | `POST /ai-rotational/student/assign/check` before module confirm |
+
+Unwrap envelopes with `unwrapAiRotationalPayload()`.
+
+## Response merge
+
+`mergePartialAiResponse(prev, incoming)` — server omits unchanged arrays.
+
+**Must clear modules** when `step === schedule_types` and `scheduleTypes` sent without `modules`.
+
+**Must retain grid** via `persistedSchedule` when `shouldRetainPersistedSchedule(step)` — includes `assistantMessage` after generation.
+
+## Chat entries from API
+
+`buildAssistantChatEntriesFromResponse(data)`:
+
+- `step === schedule` + grid → assistant bubble with `schedule`, `showSavePrompt: true`
+- `step === schedule_types` → inline picker (not duplicate numbered list in text)
+- `step === modules` / `students` → inline checklist pickers
+- Other steps → text bubbles
+
+`filterNewScheduleChatEntries` — skip duplicate grid fingerprint in chat.
+
+## Step helpers
+
+`ResponseStep` in `App.tsx` includes client-only `schedule_compare` (not a backend `SelectionStep`).
+
+```ts
+isScheduleGenerationStep(step)      // 'schedule' only — new grid bubble
+isPostGenerationWorkflowStep(step) // 'schedule' | 'completed' — save enabled
+shouldRetainPersistedSchedule(step)
+```
+
+## Save UX
+
+1. Grid footer **Save** button (`ScheduleGridTable` `savePrompt.onSave`)
+2. Opens `ScheduleSaveModal` — blocks background, asks schedule name
+3. **Cancel** closes modal; **Confirm** calls `saveCurrentSchedule(sessionId, chatMessageId?, scheduleName)`
+4. On success: `showSavePrompt: false`, `bubbleSavedScheduleId`, merge `step: 'completed'`, `schedule: null`, `scheduleId`
+
+Do not call save without `scheduleName` from modal.
+
+## Display schedule
+
+`displaySchedule = pickScheduleFromPayload(response) ?? persistedSchedule` when retain rules apply.
+
+## Pickers frozen in chat
+
+`freezePickerInChat` on confirm — sends wire message `studentIds exactly:` / `moduleIds exactly:`.
+
+## Full-page grid
+
+`ScheduleFullPage.tsx` / `schedule-full-view.ts` — expand table route, not overlay.
+
+## Do not
+
+- Create grid bubbles on `step: completed` or `step: assistantMessage`
+- Use `step === 'completed'` alone for generation detection (use helpers above)
+- Assume server always sends `schedule` after first generation

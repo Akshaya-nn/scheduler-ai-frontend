@@ -728,7 +728,7 @@ body { margin: 0; -webkit-font-smoothing: antialiased; }
   display: flex;
   flex-direction: row;
   align-items: center;
-  justify-content: space-between;
+  justify-content: flex-end;
   gap: 12px;
   flex-wrap: wrap;
   margin: 0;
@@ -741,6 +741,73 @@ body { margin: 0; -webkit-font-smoothing: antialiased; }
   margin: 0;
   font-size: 0.9rem;
   color: var(--grey-20);
+}
+
+.schedule-save-modal-overlay {
+  position: fixed;
+  inset: 0;
+  z-index: 10000;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 20px;
+}
+
+.schedule-save-modal-backdrop {
+  position: absolute;
+  inset: 0;
+  margin: 0;
+  padding: 0;
+  border: none;
+  cursor: pointer;
+  background: rgba(6, 8, 14, 0.78);
+  backdrop-filter: blur(8px);
+}
+
+.schedule-save-modal {
+  position: relative;
+  z-index: 1;
+  width: min(100%, 440px);
+  padding: 22px 22px 18px;
+  border-radius: 14px;
+  border: 1px solid var(--grey-70);
+  background: linear-gradient(180deg, rgba(22, 29, 46, 0.98) 0%, rgba(15, 18, 28, 0.98) 100%);
+  box-shadow: 0 24px 64px rgba(0, 0, 0, 0.45);
+}
+
+.schedule-save-modal-title {
+  margin: 0 0 8px;
+  font-size: 1.1rem;
+  font-weight: 700;
+  color: var(--grey-10);
+}
+
+.schedule-save-modal-text {
+  margin: 0 0 16px;
+  font-size: 0.9rem;
+  line-height: 1.45;
+  color: var(--grey-30);
+}
+
+.schedule-save-modal-label {
+  display: block;
+  margin-bottom: 8px;
+  font-size: 0.82rem;
+  font-weight: 600;
+  letter-spacing: 0.03em;
+  text-transform: uppercase;
+  color: var(--grey-20);
+}
+
+.schedule-save-modal-input {
+  width: 100%;
+  margin-bottom: 18px;
+}
+
+.schedule-save-modal-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 10px;
 }
 
 .schedule-save-actions {
