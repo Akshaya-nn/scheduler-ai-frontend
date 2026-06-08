@@ -2,6 +2,7 @@ import { FormEvent, Fragment, useCallback, useEffect, useRef, useState } from 'r
 import {
   isUsageHelpMessage,
   resolveConversationalReply,
+  resolveUnclearMessageReply,
   USAGE_HELP_ASSISTANT_REPLY,
 } from './conversational-message';
 import { ScheduleFullPageRoute } from './ScheduleFullPage';
@@ -1601,7 +1602,8 @@ export default function App() {
     }
 
     if (!sessionId) {
-      const conversationalReply = resolveConversationalReply(message);
+      const conversationalReply =
+        resolveUnclearMessageReply(message) ?? resolveConversationalReply(message);
       if (conversationalReply) {
         appendMessages([{ role: 'assistant', text: conversationalReply }]);
         return;

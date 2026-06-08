@@ -37,6 +37,9 @@ const TIME_OF_DAY_GREETING_REPLIES: ReadonlyArray<{
 
 export const THANK_YOU_ASSISTANT_REPLY = "You're welcome!";
 
+export const UNCLEAR_MESSAGE_ASSISTANT_REPLY =
+  "Hey there! I didn't quite catch that, No worries, just let me know what you need and I'm happy to help!";
+
 /** Keep in sync with backend conversational-message.ts */
 export const USAGE_HELP_ASSISTANT_REPLY =
   'I am the AI Rotational Scheduler. I help you build and update class rotation grids using chat and the panels under each message.\n\n' +
@@ -160,6 +163,59 @@ export function isThankYouMessage(message: string): boolean {
     return false;
   }
   return PURE_THANK_YOU.test(normalized);
+}
+
+const SCHEDULING_EDIT_KEYWORDS =
+  /\b(remove|drop|delete|exclude|add|include|rotation|rotations|module|modules|student|students|schedule|copy|copies|pair|pairing|generate|create|build|make|wire|yes|no|confirm|cancel|first|last|shuffle)\b/i;
+
+function tokenLooksLikeKeyboardMash(token: string): boolean {
+  const letters = token.replace(/[^a-z]/g, '');
+  if (letters.length < 6) {
+    return false;
+  }
+  const vowels = (letters.match(/[aeiou]/g) ?? []).length;
+  if (vowels === 0) {
+    return true;
+  }
+  if (vowels / letters.length < 0.12) {
+    return true;
+  }
+  return letters.length >= 6 && /^(.)\1{5,}$/.test(letters);
+}
+
+export function isUnclearUserMessage(message: string): boolean {
+  const trimmed = message.trim();
+  if (!trimmed) {
+    return false;
+  }
+  if (isGreetingMessage(message) || isThankYouMessage(message)) {
+    return false;
+  }
+  if (isUsageHelpMessage(message)) {
+    return false;
+  }
+  if (SCHEDULING_EDIT_KEYWORDS.test(trimmed)) {
+    return false;
+  }
+  const normalized = normalizeConversationalMessage(message);
+  if (!normalized) {
+    return false;
+  }
+  const tokens = normalized.split(/\s+/).filter(Boolean);
+  if (tokens.length === 0) {
+    return false;
+  }
+  if (tokens.length === 1) {
+    return tokenLooksLikeKeyboardMash(tokens[0]);
+  }
+  return (
+    tokens.length <= 5 &&
+    tokens.every((token) => token.length >= 4 && tokenLooksLikeKeyboardMash(token))
+  );
+}
+
+export function resolveUnclearMessageReply(message: string): string | null {
+  return isUnclearUserMessage(message) ? UNCLEAR_MESSAGE_ASSISTANT_REPLY : null;
 }
 
 export function buildGreetingAssistantReply(message: string): string {
