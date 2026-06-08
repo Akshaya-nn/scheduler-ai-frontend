@@ -12,6 +12,13 @@ import {
   openScheduleFullView,
   SCHEDULE_VIEW_SYNC_EVENT,
 } from './schedule-full-view';
+import { fetchSessionChatHistory } from './session-history';
+import {
+  buildSessionShareUrl,
+  readSessionIdFromPath,
+  SESSION_URL_SYNC_EVENT,
+  syncSessionIdToUrl,
+} from './session-url';
 
 function toggleId(id: string, list: string[], setter: (next: string[]) => void) {
   if (list.includes(id)) {
@@ -912,6 +919,7 @@ type CompletedScheduleEntry = {
 
 export default function App() {
   const [scheduleFullView, setScheduleFullView] = useState(() => isScheduleFullViewPath());
+  const historyLoadedForRef = useRef<string | null>(null);
 
   useEffect(() => {
     migrateLegacyScheduleFullHash();
@@ -927,6 +935,8 @@ export default function App() {
 
   const [sessionId, setSessionId] = useState('');
   const [currentClassId, setCurrentClassId] = useState('');
+  const [sharedSessionLoading, setSharedSessionLoading] = useState(false);
+  const [historySource, setHistorySource] = useState<'memory' | 'database' | null>(null);
   const [completedSchedules, setCompletedSchedules] = useState<CompletedScheduleEntry[]>([]);
   const [chatInput, setChatInput] = useState('');
   const [chatMode, setChatMode] = useState<ChatMode>('awaiting_intent');
@@ -1002,6 +1012,77 @@ export default function App() {
     },
     [appendMessages],
   );
+
+  const loadSessionHistoryFromUrl = useCallback(async (targetSessionId: string) => {
+    setSharedSessionLoading(true);
+    setError('');
+    try {
+      const data = await fetchSessionChatHistory(targetSessionId);
+      const mapped: ChatMessage[] = data.messages
+        .filter((entry) => entry.content.trim().length > 0)
+        .map((entry) => ({
+          id: nextMessageId(),
+          role: entry.role,
+          text: entry.content,
+        }));
+      setSessionId(data.sessionId);
+      setChatMode('active');
+      setHistorySource(data.source);
+      setChatMessages(
+        mapped.length > 0
+          ? mapped
+          : [
+              {
+                id: nextMessageId(),
+                role: 'assistant',
+                text: 'No messages in this session yet.',
+              },
+            ],
+      );
+      syncSessionIdToUrl(data.sessionId);
+    } catch (err) {
+      setError((err as Error).message);
+      setHistorySource(null);
+    } finally {
+      setSharedSessionLoading(false);
+    }
+  }, []);
+
+  useEffect(() => {
+    const fromUrl = readSessionIdFromPath();
+    if (!fromUrl || historyLoadedForRef.current === fromUrl) {
+      return;
+    }
+    historyLoadedForRef.current = fromUrl;
+    void loadSessionHistoryFromUrl(fromUrl);
+  }, [loadSessionHistoryFromUrl]);
+
+  useEffect(() => {
+    const onSessionUrlChange = () => {
+      const fromUrl = readSessionIdFromPath();
+      if (fromUrl && fromUrl !== sessionId && historyLoadedForRef.current !== fromUrl) {
+        historyLoadedForRef.current = fromUrl;
+        void loadSessionHistoryFromUrl(fromUrl);
+        return;
+      }
+      if (!fromUrl && sessionId) {
+        historyLoadedForRef.current = null;
+        setHistorySource(null);
+      }
+    };
+    window.addEventListener('popstate', onSessionUrlChange);
+    window.addEventListener(SESSION_URL_SYNC_EVENT, onSessionUrlChange);
+    return () => {
+      window.removeEventListener('popstate', onSessionUrlChange);
+      window.removeEventListener(SESSION_URL_SYNC_EVENT, onSessionUrlChange);
+    };
+  }, [loadSessionHistoryFromUrl, sessionId]);
+
+  useEffect(() => {
+    if (sessionId) {
+      syncSessionIdToUrl(sessionId);
+    }
+  }, [sessionId]);
 
   useEffect(() => {
     lastChatScheduleFingerprintRef.current = null;
@@ -1247,7 +1328,7 @@ export default function App() {
     const generatedNames = displaySchedule ? scheduleStudentNames(displaySchedule) : [];
   }, [response?.sessionId, response?.step, selectedStudentNamesSig, displaySchedule]);
 
-  const canSend = chatInput.trim().length > 0 && !loading;
+  const canSend = chatInput.trim().length > 0 && !loading && !sharedSessionLoading;
 
   const scheduleStepShowsGrid =
     response?.step === 'schedule' || response?.step === 'completed';
@@ -2139,6 +2220,26 @@ export default function App() {
       <section className="card">
         <h1>AI Rotational Scheduler</h1>
 
+        {sessionId ? (
+          <p className="session-share-bar">
+            <span className="session-share-label">Session:</span>{' '}
+            <code className="session-share-id">{sessionId}</code>{' '}
+            <button
+              type="button"
+              className="btn btn-outline btn-sm"
+              onClick={() => void navigator.clipboard.writeText(buildSessionShareUrl(sessionId))}
+            >
+              Copy link
+            </button>
+            {historySource ? (
+              <span className="session-share-hint">
+                {' '}
+                (history loaded from {historySource === 'memory' ? 'live session' : 'database'})
+              </span>
+            ) : null}
+          </p>
+        ) : null}
+
         <div ref={chatThreadRef} className="chat-thread" role="log" aria-live="polite">
           {chatMessages.map((message) => {
             const body = renderMessageBody(message);
@@ -2171,6 +2272,12 @@ export default function App() {
               </div>
             </div>
           )}
+          {sharedSessionLoading && !loading && (
+            <div className="msg-row msg-row-assistant">
+              <div className="msg-meta">Assistant</div>
+              <div className="bubble bubble-assistant">Loading chat history…</div>
+            </div>
+          )}
         </div>
 
         <form className="composer" onSubmit={onSubmitChat}>
@@ -2186,7 +2293,7 @@ export default function App() {
             // }
             className="input"
           />
-          <button disabled={!canSend} type="submit" className="btn">
+          <button disabled={!canSend || sharedSessionLoading} type="submit" className="btn">
             {loading ? 'Sending...' : 'Send'}
           </button>
         </form>
