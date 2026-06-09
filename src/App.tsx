@@ -125,10 +125,17 @@ function mergePartialAiResponse(prev: ApiResponse | null, incoming: Record<strin
     modules = [];
   }
   const scheduleTypeListActive = step === 'schedule_types';
+  const scheduleTypeChanged =
+    i.selectedScheduleType != null &&
+    prev?.selectedScheduleType?.type !== undefined &&
+    i.selectedScheduleType.type !== prev.selectedScheduleType.type;
+  if (scheduleTypeChanged && i.modules !== undefined) {
+    modules = i.modules;
+  }
   const incomingHasSchedule = i.schedule !== undefined && i.schedule !== null;
   const selectedModules = i.selectedModules !== undefined
     ? i.selectedModules
-    : scheduleTypeListActive
+    : scheduleTypeListActive || scheduleTypeChanged
       ? []
       : incomingHasSchedule && (prev?.selectedModules?.length ?? 0) > 0
         ? prev!.selectedModules!
@@ -1308,17 +1315,25 @@ export default function App() {
       return;
     }
     setChatMessages((prev) => {
+      let working = prev;
       const toAdd: ChatMessage[] = [];
       for (const entry of entries) {
+        if (entry.picker?.kind === 'modules') {
+          working = working.map((m) =>
+            m.picker?.kind === 'modules' && !m.picker.frozen
+              ? { ...m, picker: { ...m.picker, frozen: true } }
+              : m,
+          );
+        }
         if (
           entry.picker &&
-          prev.some((m) => m.picker?.kind === entry.picker!.kind && !m.picker.frozen)
+          working.some((m) => m.picker?.kind === entry.picker!.kind && !m.picker.frozen)
         ) {
           continue;
         }
         toAdd.push({ ...entry, id: nextMessageId() });
       }
-      return toAdd.length > 0 ? [...prev, ...toAdd] : prev;
+      return toAdd.length > 0 ? [...working, ...toAdd] : working;
     });
   }, []);
 
