@@ -432,6 +432,35 @@ body { margin: 0; -webkit-font-smoothing: antialiased; }
 
 .bubble-text-tight { margin-bottom: 8px; }
 
+.bubble-unassigned-breakdown {
+  line-height: 1.55;
+}
+
+.unassigned-breakdown-section + .unassigned-breakdown-section {
+  margin-top: 16px;
+}
+
+.unassigned-breakdown-heading {
+  margin: 0 0 10px;
+  font-weight: 600;
+  color: var(--grey-10);
+}
+
+.unassigned-breakdown-module + .unassigned-breakdown-module {
+  margin-top: 12px;
+}
+
+.unassigned-breakdown-module-name {
+  margin: 0 0 6px;
+  font-weight: 600;
+  color: var(--grey-10);
+}
+
+.unassigned-breakdown-student-list {
+  margin: 0 0 0 1.25rem;
+  padding: 0;
+}
+
 .bubble-embed { padding-bottom: 12px; }
 
 .bubble-embed-frozen {

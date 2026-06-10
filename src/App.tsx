@@ -18,7 +18,6 @@ import {
   buildSessionShareUrl,
   readSessionIdFromPath,
   SESSION_URL_SYNC_EVENT,
-  syncSessionIdToUrl,
 } from './session-url';
 
 function toggleId(id: string, list: string[], setter: (next: string[]) => void) {
@@ -65,12 +64,24 @@ type ResponseStep =
   | 'completed'
   | 'generic';
 
+const UNASSIGNED_PRIOR_SECTION_KEY = 'Already assigned in earlier schedules:';
+const UNASSIGNED_NO_SLOT_SECTION_KEY = 'Not filled due to no available slots:';
+const UNASSIGNED_ASSISTANT_SECTION_KEYS = [
+  UNASSIGNED_PRIOR_SECTION_KEY,
+  UNASSIGNED_NO_SLOT_SECTION_KEY,
+] as const;
+
+type UnassignedStudentsAssistantMessage = {
+  [UNASSIGNED_PRIOR_SECTION_KEY]?: Record<string, string[]>;
+  [UNASSIGNED_NO_SLOT_SECTION_KEY]?: Record<string, string[]>;
+};
+
 type ApiResponse = {
   statusCode?: number;
   success?: boolean;
   sessionId: string;
   step: ResponseStep;
-  assistantMessage: string;
+  assistantMessage: string | UnassignedStudentsAssistantMessage;
   /** Set after `POST session/save` succeeds. */
   scheduleId?: string;
   rotationRangeMax?: number;
@@ -151,7 +162,7 @@ function mergePartialAiResponse(prev: ApiResponse | null, incoming: Record<strin
     success: i.success ?? prev?.success,
     sessionId: (i.sessionId ?? prev?.sessionId ?? '') as string,
     step: (i.step ?? prev?.step ?? 'generic') as ApiResponse['step'],
-    assistantMessage: (i.assistantMessage ?? prev?.assistantMessage ?? '') as string,
+    assistantMessage: (i.assistantMessage ?? prev?.assistantMessage ?? '') as ApiResponse['assistantMessage'],
     rotationRangeMax:
       i.rotationRangeMax !== undefined ? i.rotationRangeMax : undefined,
     students,
@@ -220,6 +231,10 @@ type ChatMessage = {
   isError?: boolean;
   /** Preserve markdown-style tables without collapsing whitespace */
   preformatted?: boolean;
+  /** Structured unassigned-student breakdown from API */
+  unassignedAssistantMessage?: UnassignedStudentsAssistantMessage;
+  /** Legacy text breakdown in chat history */
+  unassignedBreakdown?: boolean;
   /** Frozen schedule grid shown inside the chat bubble */
   schedule?: NonNullable<ApiResponse['schedule']>;
   /** Shown between the Done line and the grid (student/assign/check preview). */
@@ -428,9 +443,24 @@ function assistantMessageLooksLikeError(text: string): boolean {
   );
 }
 
+function isUnassignedAssistantMessage(
+  message: ApiResponse['assistantMessage'],
+): message is UnassignedStudentsAssistantMessage {
+  if (typeof message !== 'object' || message === null) {
+    return false;
+  }
+  return (
+    UNASSIGNED_PRIOR_SECTION_KEY in message || UNASSIGNED_NO_SLOT_SECTION_KEY in message
+  );
+}
+
 /** Every API turn appends assistant content to the chat timeline (lists/errors stay in thread). */
 function buildAssistantChatEntriesFromResponse(data: ApiResponse): Omit<ChatMessage, 'id'>[] {
-  const raw = (data.assistantMessage ?? '').trim();
+  if (isUnassignedAssistantMessage(data.assistantMessage)) {
+    return [{ role: 'assistant', unassignedAssistantMessage: data.assistantMessage }];
+  }
+
+  const raw = typeof data.assistantMessage === 'string' ? data.assistantMessage.trim() : '';
   const grid = pickScheduleFromPayload(data);
   const step = data.step;
 
@@ -547,6 +577,9 @@ function buildAssistantChatEntriesFromResponse(data: ApiResponse): Omit<ChatMess
   if (raw.includes('| --- |')) {
     return [{ role: 'assistant', text: raw, preformatted: true }];
   }
+  if (isUnassignedStudentsBreakdownMessage(raw)) {
+    return [{ role: 'assistant', text: raw, unassignedBreakdown: true }];
+  }
   const parts = raw
     .split(/\n{2,}/)
     .map((line) => line.trim())
@@ -562,6 +595,124 @@ function buildAssistantChatEntriesFromResponse(data: ApiResponse): Omit<ChatMess
 
 const EXISTING_ASSIGNMENTS_MESSAGE_PREFIX =
   'Some students are already assigned in the same modules';
+
+const UNASSIGNED_PRIOR_HEADER = 'Already assigned in earlier schedules:';
+const UNASSIGNED_NO_SLOT_HEADER = 'Not filled due to no available slots:';
+
+function isUnassignedStudentsBreakdownMessage(text: string): boolean {
+  return (
+    text.includes(UNASSIGNED_PRIOR_HEADER) || text.includes(UNASSIGNED_NO_SLOT_HEADER)
+  );
+}
+
+function parseUnassignedModuleBlocks(sectionBody: string): Array<{ moduleName: string; students: string[] }> {
+  return sectionBody
+    .split(/\n\n+/)
+    .map((block) => block.trim())
+    .filter((block) => block.length > 0)
+    .map((block) => {
+      const lines = block.split('\n').map((line) => line.trim()).filter((line) => line.length > 0);
+      const moduleName = lines[0] ?? '';
+      const students = lines.slice(1).map((line) => line.replace(/^\d+\)\s*/, ''));
+      return { moduleName, students };
+    })
+    .filter((row) => row.moduleName.length > 0 && row.students.length > 0);
+}
+
+function parseUnassignedBreakdownSections(text: string) {
+  const sections: Array<{ heading: string; rows: Array<{ moduleName: string; students: string[] }> }> = [];
+  const priorIdx = text.indexOf(UNASSIGNED_PRIOR_HEADER);
+  const noSlotIdx = text.indexOf(UNASSIGNED_NO_SLOT_HEADER);
+
+  if (priorIdx >= 0) {
+    const body = text
+      .slice(priorIdx + UNASSIGNED_PRIOR_HEADER.length, noSlotIdx >= 0 ? noSlotIdx : text.length)
+      .trim();
+    const rows = parseUnassignedModuleBlocks(body);
+    if (rows.length > 0) {
+      sections.push({ heading: UNASSIGNED_PRIOR_HEADER, rows });
+    }
+  }
+  if (noSlotIdx >= 0) {
+    const body = text.slice(noSlotIdx + UNASSIGNED_NO_SLOT_HEADER.length).trim();
+    const rows = parseUnassignedModuleBlocks(body);
+    if (rows.length > 0) {
+      sections.push({ heading: UNASSIGNED_NO_SLOT_HEADER, rows });
+    }
+  }
+  return sections;
+}
+
+function renderUnassignedStudentsAssistantMessage(message: UnassignedStudentsAssistantMessage) {
+  const sections = UNASSIGNED_ASSISTANT_SECTION_KEYS.flatMap((heading) => {
+    const modules = message[heading];
+    if (!modules || Object.keys(modules).length === 0) {
+      return [];
+    }
+    return [{ heading, modules }];
+  });
+
+  return (
+    <div className="bubble-unassigned-breakdown">
+      {sections.map((section) => (
+        <div key={section.heading} className="unassigned-breakdown-section">
+          <p className="unassigned-breakdown-heading">{section.heading}</p>
+          {Object.entries(section.modules).map(([moduleName, students]) => (
+            <div key={`${section.heading}-${moduleName}`} className="unassigned-breakdown-module">
+              <p className="unassigned-breakdown-module-name">{moduleName}</p>
+              <ol className="unassigned-breakdown-student-list">
+                {students.map((name) => (
+                  <li key={name}>{name}</li>
+                ))}
+              </ol>
+            </div>
+          ))}
+        </div>
+      ))}
+    </div>
+  );
+}
+
+function tryParseUnassignedAssistantMessage(
+  content: string,
+): UnassignedStudentsAssistantMessage | null {
+  try {
+    const parsed = JSON.parse(content) as unknown;
+    if (isUnassignedAssistantMessage(parsed as ApiResponse['assistantMessage'])) {
+      return parsed as UnassignedStudentsAssistantMessage;
+    }
+  } catch {
+    // not JSON — fall back to legacy text parsing
+  }
+  return null;
+}
+
+function renderUnassignedStudentsBreakdownFromText(text: string) {
+  const sections = parseUnassignedBreakdownSections(text);
+  if (sections.length === 0) {
+    return <p className="bubble-text">{text}</p>;
+  }
+
+  return (
+    <div className="bubble-unassigned-breakdown">
+      {sections.map((section) => (
+        <div key={section.heading} className="unassigned-breakdown-section">
+          <p className="unassigned-breakdown-heading">{section.heading}</p>
+          {section.rows.map((row) => (
+            <div key={`${section.heading}-${row.moduleName}`} className="unassigned-breakdown-module">
+              <p className="unassigned-breakdown-module-name">{row.moduleName}</p>
+              <ol className="unassigned-breakdown-student-list">
+                {row.students.map((name) => (
+                  <li key={name}>{name}</li>
+                ))}
+              </ol>
+            </div>
+          ))}
+        </div>
+      ))}
+    </div>
+  );
+}
 
 function splitDoneAndAssignCheckNotice(assistantMessage: string): {
   doneText: string;
@@ -1171,11 +1322,26 @@ export default function App() {
       const data = await fetchSessionChatHistory(targetSessionId);
       const mapped: ChatMessage[] = data.messages
         .filter((entry) => entry.content.trim().length > 0)
-        .map((entry) => ({
-          id: nextMessageId(),
-          role: entry.role,
-          text: entry.content,
-        }));
+        .map((entry) => {
+          if (entry.role === 'assistant') {
+            const structured = tryParseUnassignedAssistantMessage(entry.content);
+            if (structured) {
+              return {
+                id: nextMessageId(),
+                role: entry.role,
+                unassignedAssistantMessage: structured,
+              };
+            }
+          }
+          return {
+            id: nextMessageId(),
+            role: entry.role,
+            text: entry.content,
+            ...(entry.role === 'assistant' && isUnassignedStudentsBreakdownMessage(entry.content)
+              ? { unassignedBreakdown: true as const }
+              : {}),
+          };
+        });
       setSessionId(data.sessionId);
       setChatMode('active');
       setHistorySource(data.source);
@@ -1190,7 +1356,6 @@ export default function App() {
               },
             ],
       );
-      syncSessionIdToUrl(data.sessionId);
     } catch (err) {
       setError((err as Error).message);
       setHistorySource(null);
@@ -1228,12 +1393,6 @@ export default function App() {
       window.removeEventListener(SESSION_URL_SYNC_EVENT, onSessionUrlChange);
     };
   }, [loadSessionHistoryFromUrl, sessionId]);
-
-  useEffect(() => {
-    if (sessionId) {
-      syncSessionIdToUrl(sessionId);
-    }
-  }, [sessionId]);
 
   useEffect(() => {
     lastChatScheduleFingerprintRef.current = null;
@@ -1354,7 +1513,8 @@ export default function App() {
 
     const moduleTimelineError =
       response?.step === 'modules' &&
-      isAwaitingModulesTimelineAssistantSurface((response.assistantMessage ?? '').trim());
+      typeof response.assistantMessage === 'string' &&
+      isAwaitingModulesTimelineAssistantSurface(response.assistantMessage.trim());
 
     if (moduleTimelineError && last?.role === 'assistant' && lastId) {
       if (moduleCapacityScrollDoneForMessageIdRef.current !== lastId) {
@@ -2384,6 +2544,12 @@ export default function App() {
       return renderInlinePicker(message);
     }
 
+    if (message.unassignedAssistantMessage) {
+      return renderUnassignedStudentsAssistantMessage(message.unassignedAssistantMessage);
+    }
+    if (message.unassignedBreakdown && message.text) {
+      return renderUnassignedStudentsBreakdownFromText(message.text);
+    }
     if (message.preformatted && message.text) {
       return <pre className="bubble-text bubble-pre-table">{message.text}</pre>;
     }
@@ -2493,59 +2659,6 @@ export default function App() {
         </form>
 
         {error && <p className="error">{error}</p>}
-
-        {/* {scheduleStepShowsGrid && displaySchedule && (
-          <div className="step-panels schedule-below-chat">
-            <section className="step-card schedule-card">
-              <h2 className="step-title">Generated schedule</h2>
-              <ScheduleGridTable schedule={displaySchedule} scrollable expandTitle="Generated schedule" />
-              <footer className="schedule-save-footer">
-                {savedScheduleId ? (
-                  <p className="schedule-save-status">Saved to Star Academy (scheduleId: {savedScheduleId})</p>
-                ) : (
-                  <button
-                    type="button"
-                    className="btn btn-save-schedule"
-                    disabled={!canSaveCurrentSchedule}
-                    onClick={() => void saveCurrentSchedule(sessionId)}
-                  >
-                    {savingSchedule ? 'Saving…' : 'Yes, save'}
-                  </button>
-                )}
-              </footer>
-            </section>
-          </div>
-        )} */}
-
-        {completedSchedules.map((entry, index) => (
-          <div key={entry.id} className="step-panels schedule-below-chat">
-            <section className="step-card schedule-card">
-              <h2 className="step-title">
-                Schedule {index + 1}
-                {entry.classId ? ` — Class ${entry.classId}` : ''}
-              </h2>
-              <ScheduleGridTable
-                schedule={entry.schedule}
-                scrollable
-                expandTitle={`Schedule ${index + 1}${entry.classId ? ` — Class ${entry.classId}` : ''}`}
-              />
-              <footer className="schedule-save-footer">
-                {entry.savedScheduleId ? (
-                  <p className="schedule-save-status">Saved (scheduleId: {entry.savedScheduleId})</p>
-                ) : (
-                  <button
-                    type="button"
-                    className="btn btn-save-schedule"
-                    disabled={savingSchedule}
-                    onClick={() => openSaveScheduleModal(entry.sessionId)}
-                  >
-                    {savingSchedule ? 'Saving…' : 'Save'}
-                  </button>
-                )}
-              </footer>
-            </section>
-          </div>
-        ))}
 
       </section>
 
