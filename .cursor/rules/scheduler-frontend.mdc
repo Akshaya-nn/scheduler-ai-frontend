@@ -29,7 +29,7 @@ Unwrap envelopes with `unwrapAiRotationalPayload()`.
 
 `mergePartialAiResponse(prev, incoming)` — server omits unchanged arrays.
 
-**Must clear modules** when `step === schedule_types` and `scheduleTypes` sent without `modules`.
+**Must clear modules** when `step === scheduleTypes` and `scheduleTypes` sent without `modules`.
 
 **Must retain grid** via `persistedSchedule` when `shouldRetainPersistedSchedule(step)` — includes `assistantMessage` after generation.
 
@@ -38,7 +38,7 @@ Unwrap envelopes with `unwrapAiRotationalPayload()`.
 `buildAssistantChatEntriesFromResponse(data)`:
 
 - `step === schedule` + grid → assistant bubble with `schedule`, `showSavePrompt: true`
-- `step === schedule_types` → inline picker (not duplicate numbered list in text)
+- `step === scheduleTypes` → inline picker (not duplicate numbered list in text)
 - `step === modules` / `students` → inline checklist pickers
 - Other steps → text bubbles
 
