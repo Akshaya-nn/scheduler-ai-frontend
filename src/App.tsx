@@ -117,8 +117,11 @@ type ApiResponse = {
     pairStudent?: boolean;
     restrictCrossScheduleModuleRepeat?: boolean;
   };
-  /** Preview schedule without copy rows; user can reply `copy` to rebuild with copy modules. */
-  awaitingCopyModuleReply?: boolean;
+  /**
+   * `yes` — preview fits primary seats only; selected students remain unplaced (show copy action).
+   * `no` — copy rows already used, or every selected student is fully placed.
+   */
+  copymodule?: 'yes' | 'no';
 };
 
 /** Merge a shaped server payload into full client state (server omits unchanged lists). */
@@ -178,13 +181,14 @@ function mergePartialAiResponse(prev: ApiResponse | null, incoming: Record<strin
     selectedModules,
     schedule: i.schedule !== undefined ? i.schedule : (prev?.schedule ?? null),
     config: i.config !== undefined ? i.config : prev?.config,
-    awaitingCopyModuleReply:
-      i.awaitingCopyModuleReply === true
-        ? true
-        : i.awaitingCopyModuleReply === false ||
-            (incomingHasSchedule && !isScheduleComparePayload(i.schedule as ApiResponse['schedule']))
-          ? false
-          : prev?.awaitingCopyModuleReply,
+    copymodule:
+      i.copymodule === 'yes' || i.copymodule === 'no'
+        ? i.copymodule
+        : isCopyModulePreviewMessage(String(i.assistantMessage ?? ''))
+          ? 'yes'
+          : incomingHasSchedule && !isScheduleComparePayload(i.schedule as ApiResponse['schedule'])
+            ? 'no'
+            : prev?.copymodule,
   };
 }
 
@@ -250,8 +254,8 @@ type ChatMessage = {
   scheduleOptions?: ScheduleComparePayload;
   /** Set when user picks A/B — collapses compare to a single option in place */
   chosenCompareOption?: 'A' | 'B';
-  /** Hint below preview grid: reply "copy" to add copy modules for all students */
-  awaitingCopyModuleReply?: boolean;
+  /** Hint below preview grid when server sent `copymodule: yes` */
+  copymodule?: 'yes' | 'no';
   /** Saved schedule id shown on this bubble after save (in-place, no extra chat line) */
   bubbleSavedScheduleId?: string;
   /** Confirmation line after save (e.g. from API assistantMessage) */
@@ -400,6 +404,13 @@ function isAwaitingModulesTimelineAssistantSurface(raw: string): boolean {
   if (/\bfor rotation 1\b/i.test(t) && /\bstudents\b/i.test(t) && /\bcapacity\b/i.test(t)) {
     return true;
   }
+  if (
+    /\b(couldn'?t seat everyone|not enough seats|too many students for rotation 1|not placed:|already assigned to)\b/i.test(
+      t,
+    )
+  ) {
+    return true;
+  }
   return false;
 }
 
@@ -441,7 +452,7 @@ function modulePickerIntroText(
   const lines: string[] = [];
   if (!looksLikeScheduleTypePrompt && preselectedModuleCount > 0) {
     lines.push(
-      `${preselectedModuleCount} item${preselectedModuleCount === 1 ? '' : 's'} marked Selected are already on your current schedule”keep them checked to retain them, tick more to add, then confirm.`,
+      `${preselectedModuleCount} already on this schedule — keep them checked, add more if needed, then confirm.`,
     );
   }
   if (stripped) {
@@ -491,10 +502,16 @@ function rotationRangePickerIntroText(assistantMessage: string): string {
   return stripped || 'Select the start and end rotation count to update, then confirm.';
 }
 
+function isCopyModulePreviewMessage(text: string): boolean {
+  const t = (text ?? '').trim();
+  if (!t) return false;
+  return /\bwithout copy rows\b/i.test(t) && /\breply copy to seat everyone\b/i.test(t);
+}
+
 function assistantMessageLooksLikeError(text: string): boolean {
   const t = text.trim();
   if (!t) return false;
-  return /\b(cannot fit|could not|invalid|not valid|must fit|error|failed|no active|please (choose|increase|reduce)|widen the range)\b/i.test(
+  return /\b(cannot fit|could not|couldn'?t seat|not enough seats|too many students|invalid|not valid|must fit|not placed:|error|failed|no active|please (choose|increase|reduce)|widen the range|already assigned to)\b/i.test(
     t,
   );
 }
@@ -538,6 +555,8 @@ function buildAssistantChatEntriesFromResponse(data: ApiResponse): Omit<ChatMess
   const compareOptions = pickScheduleCompareFromPayload(data);
   const grid = pickScheduleFromPayload(data);
   const step = data.step;
+  const copyPreview =
+    data.copymodule === 'yes' || (Boolean(grid) && isCopyModulePreviewMessage(raw));
 
   if (step === 'schedule' && compareOptions) {
     return [
@@ -549,16 +568,17 @@ function buildAssistantChatEntriesFromResponse(data: ApiResponse): Omit<ChatMess
     ];
   }
 
-  if (grid && step === 'schedule') {
+  if (grid && (step === 'schedule' || copyPreview)) {
     const { doneText, assignCheckNotice } = splitDoneAndAssignCheckNotice(raw);
+    const copymodule = copyPreview ? 'yes' : data.copymodule;
     return [
       {
         role: 'assistant',
-        text: doneText || (data.awaitingCopyModuleReply ? raw : 'Here is your generated schedule.'),
+        text: doneText || (copyPreview ? raw : 'Here is your generated schedule.'),
         ...(assignCheckNotice ? { assignCheckNotice } : {}),
         schedule: grid,
         showSavePrompt: true,
-        ...(data.awaitingCopyModuleReply ? { awaitingCopyModuleReply: true } : {}),
+        ...(copymodule === 'yes' || copymodule === 'no' ? { copymodule } : {}),
       },
     ];
   }
@@ -596,6 +616,27 @@ function buildAssistantChatEntriesFromResponse(data: ApiResponse): Omit<ChatMess
   }
 
   if (step === 'modules') {
+    const modulePickerEntry = {
+      role: 'assistant' as const,
+      picker: {
+        kind: 'modules' as const,
+        frozen: false,
+        intro: modulePickerIntroText(
+          raw,
+          data.selectedModules?.length ?? 0,
+          (data.modules?.length ?? 0) > 0,
+        ),
+        modules: data.modules ?? [],
+        selectedIds: [
+          ...new Set(
+            (data.selectedModules ?? []).map((m) => catalogIdFromExpandedModuleRowId(m.id)),
+          ),
+        ],
+        copyEachModule: false,
+        copyModuleCount: '1',
+        contentLabel: data.selectedScheduleType?.type === 'expedition' ? 'Expedition' : 'Module',
+      },
+    };
     if (isAwaitingModulesTimelineAssistantSurface(raw)) {
       return [
         {
@@ -603,31 +644,10 @@ function buildAssistantChatEntriesFromResponse(data: ApiResponse): Omit<ChatMess
           text: stripNumberedListLines(raw),
           isError: assistantMessageLooksLikeError(raw),
         },
+        modulePickerEntry,
       ];
     }
-    return [
-      {
-        role: 'assistant',
-        picker: {
-          kind: 'modules',
-          frozen: false,
-          intro: modulePickerIntroText(
-            raw,
-            data.selectedModules?.length ?? 0,
-            (data.modules?.length ?? 0) > 0,
-          ),
-          modules: data.modules ?? [],
-          selectedIds: [
-            ...new Set(
-              (data.selectedModules ?? []).map((m) => catalogIdFromExpandedModuleRowId(m.id)),
-            ),
-          ],
-          copyEachModule: false,
-          copyModuleCount: '1',
-          contentLabel: data.selectedScheduleType?.type === 'expedition' ? 'Expedition' : 'Module',
-        },
-      },
-    ];
+    return [modulePickerEntry];
   }
 
   if (isRotationRangeEditResponse(data)) {
@@ -854,6 +874,10 @@ function filterNewScheduleChatEntries(
     }
     const fp = scheduleFingerprint(entry.schedule);
     if (fp === lastScheduleFingerprintRef.current) {
+      if (entry.copymodule === 'yes') {
+        out.push(entry);
+        continue;
+      }
       if (entry.text?.trim()) {
         out.push({
           role: 'assistant',
@@ -1581,11 +1605,11 @@ export default function App() {
         return prev;
       }
 
-      const copyScheduleEntry = toAdd.find((entry) => entry.schedule && !entry.awaitingCopyModuleReply);
-      if (copyScheduleEntry?.schedule && prev.some((m) => m.awaitingCopyModuleReply && m.schedule)) {
+      const copyScheduleEntry = toAdd.find((entry) => entry.schedule && entry.copymodule !== 'yes');
+      if (copyScheduleEntry?.schedule && prev.some((m) => m.copymodule === 'yes' && m.schedule)) {
         let previewReplaced = false;
         const base = prev.flatMap((message) => {
-          if (message.awaitingCopyModuleReply && message.schedule) {
+          if (message.copymodule === 'yes' && message.schedule) {
             if (!previewReplaced) {
               previewReplaced = true;
               return [
@@ -1593,7 +1617,7 @@ export default function App() {
                   ...message,
                   ...copyScheduleEntry,
                   id: message.id,
-                  awaitingCopyModuleReply: false,
+                  copymodule: copyScheduleEntry.copymodule ?? 'no',
                 },
               ];
             }
@@ -2597,7 +2621,7 @@ export default function App() {
                 : undefined
             }
           />
-          {message.awaitingCopyModuleReply && (
+          {message.copymodule === 'yes' && (
             <div className="copy-module-reply-hint" role="note">
               <p className="copy-module-reply-hint-title">Need every student on the schedule?</p>
               <p className="copy-module-reply-hint-body">
