@@ -46,7 +46,7 @@ Unwrap envelopes with `unwrapAiRotationalPayload()`.
 
 ## Step helpers
 
-`ResponseStep` in `App.tsx` includes client-only `schedule_compare` (not a backend `SelectionStep`).
+Module-copy compare (Option A / B) uses `step: schedule` with `schedule: { optionA, optionB }` — detect via `isScheduleComparePayload()`; chat UI maps to internal `scheduleOptions` on `ChatMessage`.
 
 ```ts
 isScheduleGenerationStep(step)      // 'schedule' only — new grid bubble

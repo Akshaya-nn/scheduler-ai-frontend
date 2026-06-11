@@ -291,6 +291,46 @@ body { margin: 0; -webkit-font-smoothing: antialiased; }
   scroll-behavior: smooth;
 }
 
+.copy-module-reply-hint {
+  margin-top: 12px;
+  padding: 12px 14px;
+  border: 1px solid var(--grey-60);
+  border-radius: 10px;
+  background: rgba(56, 132, 255, 0.08);
+}
+
+.copy-module-reply-hint-title {
+  margin: 0 0 6px 0;
+  font-size: 0.86rem;
+  font-weight: 700;
+  color: var(--grey-05);
+}
+
+.copy-module-reply-hint-body {
+  margin: 0;
+  font-size: 0.82rem;
+  line-height: 1.45;
+  color: var(--grey-20);
+}
+
+.copy-module-reply-chip {
+  display: inline;
+  margin: 0 2px;
+  padding: 1px 8px;
+  border: 1px solid var(--grey-50);
+  border-radius: 999px;
+  background: var(--surface-raised);
+  color: var(--grey-05);
+  font: inherit;
+  font-weight: 600;
+  cursor: pointer;
+}
+
+.copy-module-reply-chip:hover:not(:disabled) {
+  border-color: var(--accent);
+  color: var(--accent);
+}
+
 .schedule-compare {
   display: flex;
   flex-direction: column;
@@ -365,9 +405,26 @@ body { margin: 0; -webkit-font-smoothing: antialiased; }
   align-self: stretch;
 }
 
+.msg-row-wide.msg-row-assistant {
+  align-items: stretch;
+}
+
 .msg-row-wide .bubble {
   max-width: 100%;
   width: 100%;
+}
+
+/* Schedule row: bubble shrink-wraps to message + grid width (no dead space on the right) */
+.msg-row-schedule {
+  width: 100%;
+  align-self: stretch;
+  align-items: flex-start;
+}
+
+.msg-row-schedule .bubble,
+.msg-row-schedule .bubble-has-schedule {
+  width: fit-content;
+  max-width: 100%;
 }
 
 .msg-row-error .bubble-assistant {
@@ -448,7 +505,8 @@ body { margin: 0; -webkit-font-smoothing: antialiased; }
 }
 
 .bubble-has-schedule {
-  max-width: min(90%, 680px);
+  width: fit-content;
+  max-width: 100%;
   padding-bottom: 12px;
 }
 
@@ -460,11 +518,46 @@ body { margin: 0; -webkit-font-smoothing: antialiased; }
 }
 
 .schedule-in-chat {
-  display: flex;
-  flex-direction: column;
+  display: inline-grid;
+  grid-template-columns: minmax(0, max-content);
   gap: 6px;
   margin-top: 4px;
+  max-width: 100%;
+}
+
+.schedule-in-chat .bubble-text,
+.schedule-in-chat .copy-module-reply-hint,
+.schedule-in-chat .schedule-card,
+.schedule-in-chat .schedule-table-wrap {
   min-width: 0;
+  max-width: 100%;
+}
+
+.schedule-in-chat .bubble-text,
+.schedule-in-chat .copy-module-reply-hint {
+  overflow-wrap: break-word;
+}
+
+.schedule-in-chat .schedule-table-wrap--scroll .schedule-table {
+  width: max-content;
+  min-width: 0;
+  table-layout: auto;
+}
+
+.schedule-in-chat .schedule-table th:not(.module-col),
+.schedule-in-chat .schedule-table td {
+  min-width: 108px;
+  white-space: nowrap;
+}
+
+.schedule-in-chat .schedule-compact-toolbar {
+  width: 100%;
+  box-sizing: border-box;
+}
+
+.schedule-in-chat .schedule-save-prompt {
+  width: 100%;
+  box-sizing: border-box;
 }
 
 .bubble-assign-check-notice {
@@ -1328,13 +1421,10 @@ body { margin: 0; -webkit-font-smoothing: antialiased; }
   }
 
   .bubble-has-schedule,
-  .bubble-has-schedule.bubble {
-    max-width: min(96%, 680px);
-  }
-
-  .schedule-in-chat {
-    margin-left: -4px;
-    margin-right: -4px;
+  .bubble-has-schedule.bubble,
+  .msg-row-schedule .bubble {
+    width: fit-content;
+    max-width: 100%;
   }
 
   .schedule-compact-toolbar {

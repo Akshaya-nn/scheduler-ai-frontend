@@ -50,11 +50,27 @@ type SchedulePayload = {
   warnings: string[];
 };
 
+type ScheduleComparePayload = {
+  optionA: {
+    label: string;
+    studentCount: number;
+    moduleCount: number;
+    rotationCount: number;
+    schedule: SchedulePayload;
+  };
+  optionB: {
+    label: string;
+    studentCount: number;
+    moduleCount: number;
+    rotationCount: number;
+    schedule: SchedulePayload;
+  };
+};
+
 /** Public API `step` ” what the client should show next (matches server `SelectionStep`). */
 type ResponseStep =
   | 'schedule_types'
   | 'modules'
-  | 'schedule_compare'
   | 'students'
   | 'rotation_range'
   | 'rotation_count'
@@ -80,29 +96,15 @@ type ApiResponse = {
   selectedScheduleType?: { type: string; name: string } | null;
   selectedStudents?: Student[];
   selectedModules?: ModuleItem[];
-  schedule?: SchedulePayload | null;
-  scheduleOptions?: {
-    optionA: {
-      label: string;
-      studentCount: number;
-      moduleCount: number;
-      rotationCount: number;
-      schedule: SchedulePayload;
-    };
-    optionB: {
-      label: string;
-      studentCount: number;
-      moduleCount: number;
-      rotationCount: number;
-      schedule: SchedulePayload;
-    };
-  };
+  schedule?: SchedulePayload | ScheduleComparePayload | null;
   config?: {
     startRotation?: number;
     endRotation?: number;
     pairStudent?: boolean;
     restrictCrossScheduleModuleRepeat?: boolean;
   };
+  /** Preview schedule without copy rows; user can reply `copy` to rebuild with copy modules. */
+  awaitingCopyModuleReply?: boolean;
 };
 
 /** Merge a shaped server payload into full client state (server omits unchanged lists). */
@@ -154,14 +156,15 @@ function mergePartialAiResponse(prev: ApiResponse | null, incoming: Record<strin
       i.selectedScheduleType !== undefined ? i.selectedScheduleType : prev?.selectedScheduleType,
     selectedStudents,
     selectedModules,
-    scheduleOptions:
-      i.scheduleOptions !== undefined
-        ? i.scheduleOptions
-        : step === 'schedule_compare'
-          ? prev?.scheduleOptions
-          : undefined,
     schedule: i.schedule !== undefined ? i.schedule : (prev?.schedule ?? null),
     config: i.config !== undefined ? i.config : prev?.config,
+    awaitingCopyModuleReply:
+      i.awaitingCopyModuleReply === true
+        ? true
+        : i.awaitingCopyModuleReply === false ||
+            (incomingHasSchedule && !isScheduleComparePayload(i.schedule as ApiResponse['schedule']))
+          ? false
+          : prev?.awaitingCopyModuleReply,
   };
 }
 
@@ -214,15 +217,17 @@ type ChatMessage = {
   /** Preserve markdown-style tables without collapsing whitespace */
   preformatted?: boolean;
   /** Frozen schedule grid shown inside the chat bubble */
-  schedule?: NonNullable<ApiResponse['schedule']>;
+  schedule?: SchedulePayload;
   /** Shown between the Done line and the grid (student/assign/check preview). */
   assignCheckNotice?: string;
   /** Show Yes/No save footer under the grid in this bubble */
   showSavePrompt?: boolean;
-  /** Inline two-schedule compare card (Option A / B) */
-  scheduleOptions?: NonNullable<ApiResponse['scheduleOptions']>;
+  /** Inline two-schedule compare card (legacy Option A / B side-by-side) */
+  scheduleOptions?: ScheduleComparePayload;
   /** Set when user picks A/B — collapses compare to a single option in place */
   chosenCompareOption?: 'A' | 'B';
+  /** Hint below preview grid: reply "copy" to add copy modules for all students */
+  awaitingCopyModuleReply?: boolean;
   /** Saved schedule id shown on this bubble after save (in-place, no extra chat line) */
   bubbleSavedScheduleId?: string;
   /** Confirmation line after save (e.g. from API assistantMessage) */
@@ -239,20 +244,57 @@ function isRotationalIntent(message: string): boolean {
   return keywords.some((keyword) => value.includes(keyword));
 }
 
+/** User wants to change the grid already shown — not start over. Keep in sync with backend `isEditExistingScheduleIntent`. */
+function isEditExistingScheduleIntent(message: string): boolean {
+  const value = message.toLowerCase().trim();
+  if (!value) {
+    return false;
+  }
+  if (
+    /\b(?:above|this|the|that|existing|current|generated)\s+(?:schedule|grid)\b/.test(value) ||
+    /\b(?:to|on|in)\s+(?:the\s+)?(?:above\s+)?schedule\b/.test(value)
+  ) {
+    return true;
+  }
+  const editVerb =
+    /\b(add|remove|delete|drop|exclude|include|append|insert|update|change|modify|edit|adjust|reduce|increase)\b/.test(
+      value,
+    );
+  const rosterOrGrid =
+    /\b(modules?|rotations?|students?|learners?|rows?|cop(?:y|ies)|pairing)\b/.test(value);
+  if (editVerb && rosterOrGrid) {
+    return true;
+  }
+  if (
+    /\b(?:one|another|\d+)\s+more\s+(?:modules?|rotations?)\b/.test(value) &&
+    !/\b(?:create|start|make|build|generate)\s+(?:(?:a|one)\s+)?(?:new|another|fresh)\s+(?:rotational\s+)?schedule\b/.test(
+      value,
+    )
+  ) {
+    return true;
+  }
+  return false;
+}
+
 /** Detect when user wants to start a brand new schedule after one is already generated. */
 function isCreateNewScheduleIntent(message: string): boolean {
   const value = message.toLowerCase().trim();
-  if (!value) return false;
-  const hasScheduleWord = /\b(schedule|rotational|rotation)\b/.test(value);
-  const hasFreshness = /\b(new|another|next|fresh|one\s+more|additional|again)\b/.test(value);
-  const explicitCreate =
-    /^\s*(create|generate|make|build|start|do)\b[^\n]*\b(another|new|fresh|next|additional|one\s+more|again)\b/.test(
-      value,
-    );
-  if (explicitCreate) {
-    return true;
+  if (!value) {
+    return false;
   }
-  return hasScheduleWord && hasFreshness;
+  if (isEditExistingScheduleIntent(value)) {
+    return false;
+  }
+  const explicitNewSchedule =
+    /\b(?:new|another|fresh|next)\s+(?:rotational\s+)?schedule\b/.test(value) ||
+    /\b(?:create|start|make|build|generate)\s+(?:(?:a|one)\s+)?(?:new|another|fresh)\s+(?:rotational\s+)?schedule\b/.test(
+      value,
+    ) ||
+    /\b(?:start|begin)\s+(?:over|from\s+scratch)\b/.test(value);
+  const explicitCreate =
+    /^\s*(create|generate|make|build|start|do)\b[^\n]*\b(another|new|fresh|next|again)\b/.test(value) &&
+    /\bschedule\b/.test(value);
+  return explicitNewSchedule || explicitCreate;
 }
 
 /** Extract first 24-char Mongo ObjectId from a free-text message. */
@@ -421,21 +463,51 @@ function assistantMessageLooksLikeError(text: string): boolean {
   );
 }
 
+function isScheduleComparePayload(value: ApiResponse['schedule']): value is ScheduleComparePayload {
+  if (!value || typeof value !== 'object') {
+    return false;
+  }
+  const candidate = value as ScheduleComparePayload;
+  return (
+    Boolean(candidate.optionA?.schedule && candidate.optionB?.schedule) &&
+    !Array.isArray((value as SchedulePayload).seats)
+  );
+}
+
+function pickScheduleCompareFromPayload(data: ApiResponse): ScheduleComparePayload | null {
+  if (isScheduleComparePayload(data.schedule)) {
+    return data.schedule;
+  }
+  return null;
+}
+
 /** Every API turn appends assistant content to the chat timeline (lists/errors stay in thread). */
 function buildAssistantChatEntriesFromResponse(data: ApiResponse): Omit<ChatMessage, 'id'>[] {
   const raw = (data.assistantMessage ?? '').trim();
+  const compareOptions = pickScheduleCompareFromPayload(data);
   const grid = pickScheduleFromPayload(data);
   const step = data.step;
+
+  if (step === 'schedule' && compareOptions) {
+    return [
+      {
+        role: 'assistant',
+        text: raw,
+        scheduleOptions: compareOptions,
+      },
+    ];
+  }
 
   if (grid && step === 'schedule') {
     const { doneText, assignCheckNotice } = splitDoneAndAssignCheckNotice(raw);
     return [
       {
         role: 'assistant',
-        text: doneText || 'Here is your generated schedule.',
+        text: doneText || (data.awaitingCopyModuleReply ? raw : 'Here is your generated schedule.'),
         ...(assignCheckNotice ? { assignCheckNotice } : {}),
         schedule: grid,
         showSavePrompt: true,
+        ...(data.awaitingCopyModuleReply ? { awaitingCopyModuleReply: true } : {}),
       },
     ];
   }
@@ -503,16 +575,6 @@ function buildAssistantChatEntriesFromResponse(data: ApiResponse): Omit<ChatMess
           copyModuleCount: '1',
           contentLabel: data.selectedScheduleType?.type === 'expedition' ? 'Expedition' : 'Module',
         },
-      },
-    ];
-  }
-
-  if (step === 'schedule_compare' && data.scheduleOptions) {
-    return [
-      {
-        role: 'assistant',
-        text: raw,
-        scheduleOptions: data.scheduleOptions,
       },
     ];
   }
@@ -648,7 +710,7 @@ function getSeatSlot(cell: unknown, slot: 0 | 1): string {
   return '(empty)';
 }
 
-function scheduleStudentNames(schedule: NonNullable<ApiResponse['schedule']>): string[] {
+function scheduleStudentNames(schedule: SchedulePayload): string[] {
   const seen = new Set<string>();
   const names: string[] = [];
   for (const row of schedule.seats ?? []) {
@@ -668,7 +730,7 @@ function scheduleStudentNames(schedule: NonNullable<ApiResponse['schedule']>): s
   return names;
 }
 
-function scheduleRotationColumnCount(schedule: NonNullable<ApiResponse['schedule']>): number {
+function scheduleRotationColumnCount(schedule: SchedulePayload): number {
   const rows = schedule.seats ?? [];
   const widest = rows.reduce((max, row) => Math.max(max, row?.length ?? 0), 0);
   const n = Math.max(schedule.colCount ?? 0, widest);
@@ -676,7 +738,7 @@ function scheduleRotationColumnCount(schedule: NonNullable<ApiResponse['schedule
 }
 
 /** Render primary module row followed immediately by its copy rows. */
-function scheduleRowDisplayOrder(schedule: NonNullable<ApiResponse['schedule']>): number[] {
+function scheduleRowDisplayOrder(schedule: SchedulePayload): number[] {
   const rows = schedule.rowData ?? [];
   const seatRows = schedule.seats ?? [];
   if (rows.length === 0 && seatRows.length > 0) {
@@ -711,7 +773,7 @@ function scheduleRowDisplayOrder(schedule: NonNullable<ApiResponse['schedule']>)
   return out;
 }
 
-function scheduleFingerprint(schedule: NonNullable<ApiResponse['schedule']>): string {
+function scheduleFingerprint(schedule: SchedulePayload): string {
   return JSON.stringify({
     seats: schedule.seats ?? [],
     rowData: schedule.rowData ?? [],
@@ -732,8 +794,8 @@ function findLatestPendingCompareMessage(messages: ChatMessage[]): ChatMessage |
 
 function resolveChosenCompareOption(
   choice: 'A' | 'B' | null | undefined,
-  options: NonNullable<ApiResponse['scheduleOptions']>,
-  schedule: NonNullable<ApiResponse['schedule']>,
+  options: ScheduleComparePayload,
+  schedule: SchedulePayload,
 ): 'A' | 'B' {
   if (choice === 'A' || choice === 'B') {
     return choice;
@@ -749,7 +811,7 @@ function resolveChosenCompareOption(
 }
 
 function compareChoiceCaption(
-  options: NonNullable<ApiResponse['scheduleOptions']>,
+  options: ScheduleComparePayload,
   choice: 'A' | 'B',
   assistantMessage?: string,
 ): string {
@@ -767,7 +829,7 @@ function compareChoiceCaption(
 function collapseCompareMessageToSchedule(
   message: ChatMessage,
   choice: 'A' | 'B',
-  schedule: NonNullable<ApiResponse['schedule']>,
+  schedule: SchedulePayload,
   assistantMessage?: string,
 ): ChatMessage {
   const options = message.scheduleOptions!;
@@ -797,19 +859,19 @@ function unwrapAiRotationalPayload(raw: Record<string, unknown>): Record<string,
   return raw;
 }
 
-function pickScheduleFromPayload(data: ApiResponse): ApiResponse['schedule'] | null {
+function pickScheduleFromPayload(data: ApiResponse): SchedulePayload | null {
   const s = data.schedule;
-  if (s == null || typeof s !== 'object') {
+  if (s == null || typeof s !== 'object' || isScheduleComparePayload(s)) {
     return null;
   }
   if (!Array.isArray((s as { seats?: unknown }).seats)) {
     return null;
   }
-  return s as ApiResponse['schedule'];
+  return s as SchedulePayload;
 }
 
 /** Prefer fresh grid from the response; keep last grid when API omits it (e.g. reopening module picker after `completed`). */
-function mergePersistedSchedule(data: ApiResponse, previous: ApiResponse['schedule'] | null): ApiResponse['schedule'] | null {
+function mergePersistedSchedule(data: ApiResponse, previous: SchedulePayload | null): SchedulePayload | null {
   const picked = pickScheduleFromPayload(data);
   if (picked !== null) {
     return picked;
@@ -956,7 +1018,7 @@ function ScheduleGridTable({
   showExpandControl = true,
   expandTitle = 'Schedule overview',
 }: {
-  schedule: NonNullable<ApiResponse['schedule']>;
+  schedule: SchedulePayload;
   scrollable?: boolean;
   savePrompt?: { onSave: () => void; saving?: boolean };
   /** Inline compact view only — opens dedicated full-page view (not an overlay). */
@@ -1054,7 +1116,7 @@ type CompletedScheduleEntry = {
   id: string;
   sessionId: string;
   classId: string;
-  schedule: NonNullable<ApiResponse['schedule']>;
+  schedule: SchedulePayload;
   generatedAt: number;
   savedScheduleId?: string;
 };
@@ -1085,7 +1147,7 @@ export default function App() {
   const [loading, setLoading] = useState(false);
   const [response, setResponse] = useState<ApiResponse | null>(null);
   /** Keeps the last generated grid if a later API message omits `schedule`. */
-  const [persistedSchedule, setPersistedSchedule] = useState<ApiResponse['schedule'] | null>(null);
+  const [persistedSchedule, setPersistedSchedule] = useState<SchedulePayload | null>(null);
   const [studentSelection, setStudentSelection] = useState<string[]>([]);
   const [moduleSelection, setModuleSelection] = useState<string[]>([]);
   const [scheduleTypeSelection, setScheduleTypeSelection] = useState<string>('');
@@ -1318,7 +1380,36 @@ export default function App() {
         }
         toAdd.push({ ...entry, id: nextMessageId() });
       }
-      return toAdd.length > 0 ? [...prev, ...toAdd] : prev;
+      if (toAdd.length === 0) {
+        return prev;
+      }
+
+      const copyScheduleEntry = toAdd.find((entry) => entry.schedule && !entry.awaitingCopyModuleReply);
+      if (copyScheduleEntry?.schedule && prev.some((m) => m.awaitingCopyModuleReply && m.schedule)) {
+        let previewReplaced = false;
+        const base = prev.flatMap((message) => {
+          if (message.awaitingCopyModuleReply && message.schedule) {
+            if (!previewReplaced) {
+              previewReplaced = true;
+              return [
+                {
+                  ...message,
+                  ...copyScheduleEntry,
+                  id: message.id,
+                  awaitingCopyModuleReply: false,
+                },
+              ];
+            }
+            return [];
+          }
+          return [message];
+        });
+        lastChatScheduleFingerprintRef.current = scheduleFingerprint(copyScheduleEntry.schedule);
+        const remainder = toAdd.filter((entry) => entry !== copyScheduleEntry);
+        return remainder.length > 0 ? [...base, ...remainder] : base;
+      }
+
+      return [...prev, ...toAdd];
     });
   }, []);
 
@@ -2293,6 +2384,23 @@ export default function App() {
                 : undefined
             }
           />
+          {message.awaitingCopyModuleReply && (
+            <div className="copy-module-reply-hint" role="note">
+              <p className="copy-module-reply-hint-title">Need every student on the schedule?</p>
+              <p className="copy-module-reply-hint-body">
+                This preview fits fewer students without duplicate module rows. Type{' '}
+                <button
+                  type="button"
+                  className="copy-module-reply-chip"
+                  disabled={loading}
+                  onClick={() => void sendMessage('copy')}
+                >
+                  copy
+                </button>{' '}
+                in the chat to rebuild with copy modules for all students.
+              </p>
+            </div>
+          )}
           {message.saveSuccessMessage && (
             <footer className="schedule-save-footer schedule-save-footer-inline">
               <p className="schedule-save-status">{message.saveSuccessMessage}</p>
@@ -2426,11 +2534,12 @@ export default function App() {
               return null;
             }
             const isDualCompare = Boolean(message.scheduleOptions && !message.chosenCompareOption);
+            const isScheduleMessage = Boolean(message.schedule);
             return (
               <div
                 key={message.id}
                 id={`chat-msg-${message.id}`}
-                className={`msg-row ${message.role === 'user' ? 'msg-row-user' : 'msg-row-assistant'}${message.isError ? ' msg-row-error' : ''}${isDualCompare ? ' msg-row-wide' : ''}`}
+                className={`msg-row ${message.role === 'user' ? 'msg-row-user' : 'msg-row-assistant'}${message.isError ? ' msg-row-error' : ''}${isDualCompare ? ' msg-row-wide' : isScheduleMessage ? ' msg-row-schedule' : ''}`}
               >
                 <div className="msg-meta">{message.role === 'user' ? 'You' : 'Assistant'}</div>
                 <div
