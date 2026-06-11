@@ -100,7 +100,10 @@ type ApiResponse = {
   assistantMessage: string | UnassignedStudentsAssistantMessage;
   /** Set after `POST session/save` succeeds. */
   scheduleId?: string;
-  rotationRangeMax?: number;
+  rotation_range?: {
+    startRotation: number;
+    endRotation: number;
+  };
   students: Student[];
   modules: ModuleItem[];
   scheduleTypes?: ScheduleTypeItem[];
@@ -165,8 +168,7 @@ function mergePartialAiResponse(prev: ApiResponse | null, incoming: Record<strin
     sessionId: (i.sessionId ?? prev?.sessionId ?? '') as string,
     step: (i.step ?? prev?.step ?? 'generic') as ApiResponse['step'],
     assistantMessage: (i.assistantMessage ?? prev?.assistantMessage ?? '') as ApiResponse['assistantMessage'],
-    rotationRangeMax:
-      i.rotationRangeMax !== undefined ? i.rotationRangeMax : undefined,
+    rotation_range: i.rotation_range !== undefined ? i.rotation_range : undefined,
     students,
     modules,
     scheduleTypes: i.scheduleTypes !== undefined ? i.scheduleTypes : prev?.scheduleTypes,
@@ -467,9 +469,21 @@ function modulePickerIntroText(
   return lines;
 }
 
-/** API sends `rotationRangeMax` only while the user is editing start/end rotations. */
+/** API uses `step: rotation_range` while the user is editing start/end rotations. */
 function isRotationRangeEditResponse(data: ApiResponse): boolean {
-  return typeof data.rotationRangeMax === 'number' && data.rotationRangeMax >= 2;
+  return data.step === 'rotation_range';
+}
+
+function resolveRotationRangeMaxEnd(data: ApiResponse): number {
+  const grid = pickScheduleFromPayload(data);
+  if (grid && typeof grid.colCount === 'number' && grid.colCount >= 2) {
+    return grid.colCount;
+  }
+  const fromConfig = data.config?.endRotation;
+  if (typeof fromConfig === 'number' && fromConfig >= 2) {
+    return fromConfig;
+  }
+  return 2;
 }
 
 function rotationRangePickerIntroText(assistantMessage: string): string {
@@ -617,7 +631,8 @@ function buildAssistantChatEntriesFromResponse(data: ApiResponse): Omit<ChatMess
   }
 
   if (isRotationRangeEditResponse(data)) {
-    const maxEnd = Math.max(2, data.rotationRangeMax!);
+    const maxEnd = resolveRotationRangeMaxEnd(data);
+    const range = data.rotation_range;
     return [
       {
         role: 'assistant',
@@ -625,8 +640,8 @@ function buildAssistantChatEntriesFromResponse(data: ApiResponse): Omit<ChatMess
           kind: 'rotation_range',
           frozen: false,
           intro: rotationRangePickerIntroText(raw),
-          start: String(data.config?.startRotation ?? 1),
-          end: String(data.config?.endRotation ?? maxEnd),
+          start: String(range?.startRotation ?? data.config?.startRotation ?? 1),
+          end: String(range?.endRotation ?? data.config?.endRotation ?? maxEnd),
           maxEnd,
         },
       },
@@ -820,6 +835,7 @@ function shouldRetainPersistedSchedule(step: ApiResponse['step'] | undefined): b
     step === 'schedule_types' ||
     step === 'students' ||
     step === 'rotation_count' ||
+    step === 'rotation_range' ||
     step === 'rotation_capacity' ||
     step === 'pairing' ||
     step === 'generic'
@@ -1064,13 +1080,20 @@ function resolveModuleCatalogIdsForAssignCheck(
 
 /** Call `student/assign/check` before turns that can generate or regenerate the grid. */
 function shouldRunAssignCheckBeforeSend(
-  payload: string | { moduleIds: string[] } | { studentIds: string[] },
+  payload:
+    | string
+    | { moduleIds: string[] }
+    | { studentIds: string[] }
+    | { startRotation: number; endRotation: number },
   moduleCatalogIds: string[],
 ): boolean {
   if (moduleCatalogIds.length === 0) {
     return false;
   }
   if (typeof payload !== 'string' && 'moduleIds' in payload) {
+    return true;
+  }
+  if (typeof payload !== 'string' && 'startRotation' in payload && 'endRotation' in payload) {
     return true;
   }
   if (typeof payload === 'string') {
@@ -1688,17 +1711,20 @@ export default function App() {
     if (!response || !isRotationRangeEditResponse(response)) {
       return;
     }
-    const maxEnd = Math.max(2, response.rotationRangeMax!);
-    const curStart = response.config?.startRotation ?? 1;
-    const curEnd = response.config?.endRotation ?? maxEnd;
+    const maxEnd = resolveRotationRangeMaxEnd(response);
+    const range = response.rotation_range;
+    const curStart = range?.startRotation ?? response.config?.startRotation ?? 1;
+    const curEnd = range?.endRotation ?? response.config?.endRotation ?? maxEnd;
     setStartRotationSelection(String(Math.min(Math.max(1, curStart), maxEnd - 1)));
     setEndRotationSelection(String(Math.min(Math.max(curEnd, 2), maxEnd)));
   }, [
     response?.sessionId,
     response?.step,
-    response?.rotationRangeMax,
+    response?.rotation_range?.startRotation,
+    response?.rotation_range?.endRotation,
     response?.config?.startRotation,
     response?.config?.endRotation,
+    response?.schedule,
   ]);
 
   const normalizedSchedule = response ? pickScheduleFromPayload(response) : null;
@@ -1912,16 +1938,28 @@ export default function App() {
     studentIds: string[];
   };
 
+  type SessionRotationRangePayload = {
+    startRotation: number;
+    endRotation: number;
+  };
+
   /** POST session/message body — module/student picks use structured fields, not `message`. */
   function buildSessionMessageBody(
     activeSessionId: string,
-    payload: string | SessionModuleIdsPayload | SessionStudentIdsPayload,
+    payload: string | SessionModuleIdsPayload | SessionStudentIdsPayload | SessionRotationRangePayload,
   ): Record<string, unknown> {
     if (typeof payload === 'string') {
       return { sessionId: activeSessionId, message: payload };
     }
     if ('studentIds' in payload) {
       return { sessionId: activeSessionId, studentIds: payload.studentIds };
+    }
+    if ('startRotation' in payload && 'endRotation' in payload) {
+      return {
+        sessionId: activeSessionId,
+        startRotation: payload.startRotation,
+        endRotation: payload.endRotation,
+      };
     }
     const body: Record<string, unknown> = {
       sessionId: activeSessionId,
@@ -1937,7 +1975,7 @@ export default function App() {
   }
 
   async function sendMessage(
-    payload: string | SessionModuleIdsPayload | SessionStudentIdsPayload,
+    payload: string | SessionModuleIdsPayload | SessionStudentIdsPayload | SessionRotationRangePayload,
   ): Promise<boolean> {
     const activeSessionId = sessionId;
     if (!activeSessionId) return false;
@@ -2166,7 +2204,7 @@ export default function App() {
   async function confirmRotationRangeSelection() {
     if (!response || !isRotationRangeEditResponse(response)) return;
     if (loading) return;
-    const maxEnd = Math.max(2, response.rotationRangeMax!);
+    const maxEnd = resolveRotationRangeMaxEnd(response);
     const start = Number.parseInt(startRotationSelection, 10);
     const end = Number.parseInt(endRotationSelection, 10);
     if (!rotationRangeSpanValid(start, end, maxEnd)) return;
@@ -2175,14 +2213,14 @@ export default function App() {
       p.kind === 'rotation_range' ? { ...p, frozen: true, start: String(start), end: String(end) } : p,
     );
     appendUserText(`Rotations ${start}–${end}`);
-    await sendMessage(`start rotation exactly ${start} end rotation exactly ${end}`);
+    await sendMessage({ startRotation: start, endRotation: end });
   }
 
   function stepToPickerKind(step: ResponseStep | undefined): ChatPicker['kind'] | null {
     if (step === 'schedule_types') return 'schedule_types';
     if (step === 'modules') return 'modules';
     if (step === 'students') return 'students';
-    if (response && isRotationRangeEditResponse(response)) return 'rotation_range';
+    if (step === 'rotation_range') return 'rotation_range';
     return null;
   }
 
