@@ -168,7 +168,12 @@ function mergePartialAiResponse(prev: ApiResponse | null, incoming: Record<strin
     sessionId: (i.sessionId ?? prev?.sessionId ?? '') as string,
     step: (i.step ?? prev?.step ?? 'generic') as ApiResponse['step'],
     assistantMessage: (i.assistantMessage ?? prev?.assistantMessage ?? '') as ApiResponse['assistantMessage'],
-    rotation_range: i.rotation_range !== undefined ? i.rotation_range : undefined,
+    rotation_range:
+      i.rotation_range !== undefined
+        ? i.rotation_range
+        : step === 'rotation_range'
+          ? prev?.rotation_range
+          : undefined,
     students,
     modules,
     scheduleTypes: i.scheduleTypes !== undefined ? i.scheduleTypes : prev?.scheduleTypes,
@@ -179,12 +184,14 @@ function mergePartialAiResponse(prev: ApiResponse | null, incoming: Record<strin
     schedule: i.schedule !== undefined ? i.schedule : (prev?.schedule ?? null),
     config: i.config !== undefined ? i.config : prev?.config,
     awaitingCopyModuleReply:
-      i.awaitingCopyModuleReply === true
-        ? true
-        : i.awaitingCopyModuleReply === false ||
-            (incomingHasSchedule && !isScheduleComparePayload(i.schedule as ApiResponse['schedule']))
-          ? false
-          : prev?.awaitingCopyModuleReply,
+      step === 'rotation_range'
+        ? false
+        : i.awaitingCopyModuleReply === true
+          ? true
+          : i.awaitingCopyModuleReply === false ||
+              (incomingHasSchedule && !isScheduleComparePayload(i.schedule as ApiResponse['schedule']))
+            ? false
+            : prev?.awaitingCopyModuleReply,
   };
 }
 
@@ -549,6 +556,24 @@ function buildAssistantChatEntriesFromResponse(data: ApiResponse): Omit<ChatMess
     ];
   }
 
+  if (isRotationRangeEditResponse(data)) {
+    const maxEnd = resolveRotationRangeMaxEnd(data);
+    const range = data.rotation_range;
+    return [
+      {
+        role: 'assistant',
+        picker: {
+          kind: 'rotation_range',
+          frozen: false,
+          intro: rotationRangePickerIntroText(raw),
+          start: String(range?.startRotation ?? data.config?.startRotation ?? 1),
+          end: String(range?.endRotation ?? data.config?.endRotation ?? maxEnd),
+          maxEnd,
+        },
+      },
+    ];
+  }
+
   if (grid && step === 'schedule') {
     const { doneText, assignCheckNotice } = splitDoneAndAssignCheckNotice(raw);
     return [
@@ -625,24 +650,6 @@ function buildAssistantChatEntriesFromResponse(data: ApiResponse): Omit<ChatMess
           copyEachModule: false,
           copyModuleCount: '1',
           contentLabel: data.selectedScheduleType?.type === 'expedition' ? 'Expedition' : 'Module',
-        },
-      },
-    ];
-  }
-
-  if (isRotationRangeEditResponse(data)) {
-    const maxEnd = resolveRotationRangeMaxEnd(data);
-    const range = data.rotation_range;
-    return [
-      {
-        role: 'assistant',
-        picker: {
-          kind: 'rotation_range',
-          frozen: false,
-          intro: rotationRangePickerIntroText(raw),
-          start: String(range?.startRotation ?? data.config?.startRotation ?? 1),
-          end: String(range?.endRotation ?? data.config?.endRotation ?? maxEnd),
-          maxEnd,
         },
       },
     ];
@@ -1061,47 +1068,6 @@ function catalogIdFromExpandedModuleRowId(id: string): string {
   return id.replace(/::__copy_\d+(?:_\d+)?$/i, '');
 }
 
-function normalizeModuleCatalogIds(ids: string[]): string[] {
-  return Array.from(new Set(ids.map((id) => catalogIdFromExpandedModuleRowId(id.trim())).filter((id) => id.length > 0)));
-}
-
-function resolveModuleCatalogIdsForAssignCheck(
-  resp: ApiResponse | null,
-  modulePayloadIds?: string[],
-): string[] {
-  if (modulePayloadIds && modulePayloadIds.length > 0) {
-    return normalizeModuleCatalogIds(modulePayloadIds);
-  }
-  if ((resp?.selectedModules?.length ?? 0) > 0) {
-    return normalizeModuleCatalogIds((resp?.selectedModules ?? []).map((module) => module.id));
-  }
-  return [];
-}
-
-/** Call `student/assign/check` before turns that can generate or regenerate the grid. */
-function shouldRunAssignCheckBeforeSend(
-  payload:
-    | string
-    | { moduleIds: string[] }
-    | { studentIds: string[] }
-    | { startRotation: number; endRotation: number },
-  moduleCatalogIds: string[],
-): boolean {
-  if (moduleCatalogIds.length === 0) {
-    return false;
-  }
-  if (typeof payload !== 'string' && 'moduleIds' in payload) {
-    return true;
-  }
-  if (typeof payload !== 'string' && 'startRotation' in payload && 'endRotation' in payload) {
-    return true;
-  }
-  if (typeof payload === 'string') {
-    return /start rotation exactly/i.test(payload) || /end rotation exactly/i.test(payload);
-  }
-  return false;
-}
-
 type SaveModalRequest = {
   sessionId: string;
   chatMessageId?: string;
@@ -1348,13 +1314,6 @@ export default function App() {
   ]);
 
   const chatThreadRef = useRef<HTMLDivElement>(null);
-  /**
-   * Student ids sent to `student/assign/check` on module confirm.
-   * `['all']` until the user confirms the student checklist; then the confirmed selection.
-   */
-  const assignCheckStudentIdsRef = useRef<string[]>(['all']);
-  /** Set when the user confirms the student checklist or sends structured studentIds. */
-  const studentRosterTouchedRef = useRef(false);
   /** Skip duplicate schedule cards in chat when the grid unchanged. */
   const lastChatScheduleFingerprintRef = useRef<string | null>(null);
   /** Tracks A/B click while the compare API round-trip is in flight */
@@ -1489,7 +1448,7 @@ export default function App() {
     if (!response) {
       return;
     }
-    const activeKind = stepToPickerKind(response.step);
+    const activeKind = stepToPickerKind(response);
     setChatMessages((prev) =>
       prev.map((m) => {
         if (!m.picker || m.picker.frozen || m.picker.kind === activeKind) {
@@ -1682,23 +1641,6 @@ export default function App() {
     }
     setStudentSelection((response.selectedStudents ?? []).map((s) => s.id));
   }, [response?.sessionId, response?.step, selectedStudentIdsSig]);
-
-  /** After a roster update, keep assign-check studentIds aligned with the server selection. */
-  useEffect(() => {
-    if (!response?.sessionId || !studentRosterTouchedRef.current) {
-      return;
-    }
-    const selectedIds = Array.from(
-      new Set(
-        (response.selectedStudents ?? [])
-          .map((student) => student.id.trim())
-          .filter((id) => id.length > 0),
-      ),
-    );
-    if (selectedIds.length > 0) {
-      assignCheckStudentIdsRef.current = selectedIds;
-    }
-  }, [response?.sessionId, selectedStudentIdsSig]);
 
   /** Reset the schedule-type radio selection whenever the list or step changes. */
   const scheduleTypesSig = (response?.scheduleTypes ?? []).map((t) => t.id).join('|');
@@ -1916,8 +1858,6 @@ export default function App() {
       setPersistedSchedule(mergePersistedSchedule(data, null));
       setStudentSelection([]);
       setModuleSelection([]);
-      assignCheckStudentIdsRef.current = ['all'];
-      studentRosterTouchedRef.current = false;
       setCopyEachModule(false);
       setCopyModuleCount('1');
       appendAssistantEntriesFromResponse(data);
@@ -1980,11 +1920,6 @@ export default function App() {
     const activeSessionId = sessionId;
     if (!activeSessionId) return false;
 
-    if (typeof payload !== 'string' && 'studentIds' in payload) {
-      assignCheckStudentIdsRef.current = [...payload.studentIds];
-      studentRosterTouchedRef.current = true;
-    }
-
     setLoading(true);
     setError('');
     try {
@@ -2037,8 +1972,6 @@ export default function App() {
     setSavedScheduleId(null);
     setStudentSelection([]);
     setModuleSelection([]);
-    assignCheckStudentIdsRef.current = ['all'];
-    studentRosterTouchedRef.current = false;
     setScheduleTypeSelection('');
     setCopyEachModule(false);
     setCopyModuleCount('1');
@@ -2142,8 +2075,6 @@ export default function App() {
       p.kind === 'students' ? { ...p, frozen: true, selectedIds: [...studentSelection] } : p,
     );
     appendUserSelection(`Selected students (${names.length})`, names);
-    studentRosterTouchedRef.current = true;
-    assignCheckStudentIdsRef.current = [...studentSelection];
     await sendMessage({ studentIds: [...studentSelection] });
   }
 
@@ -2216,11 +2147,12 @@ export default function App() {
     await sendMessage({ startRotation: start, endRotation: end });
   }
 
-  function stepToPickerKind(step: ResponseStep | undefined): ChatPicker['kind'] | null {
-    if (step === 'schedule_types') return 'schedule_types';
-    if (step === 'modules') return 'modules';
-    if (step === 'students') return 'students';
-    if (step === 'rotation_range') return 'rotation_range';
+  function stepToPickerKind(data: ApiResponse | null): ChatPicker['kind'] | null {
+    if (!data) return null;
+    if (data.step === 'schedule_types') return 'schedule_types';
+    if (data.step === 'modules') return 'modules';
+    if (data.step === 'students') return 'students';
+    if (isRotationRangeEditResponse(data)) return 'rotation_range';
     return null;
   }
 
@@ -2229,7 +2161,7 @@ export default function App() {
     if (!picker) {
       return null;
     }
-    const activeKind = stepToPickerKind(response?.step);
+    const activeKind = stepToPickerKind(response);
     const interactive = !picker.frozen && picker.kind === activeKind && !loading;
 
     if (picker.kind === 'schedule_types') {
