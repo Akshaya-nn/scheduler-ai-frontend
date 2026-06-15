@@ -171,7 +171,12 @@ function mergePartialAiResponse(prev: ApiResponse | null, incoming: Record<strin
     sessionId: (i.sessionId ?? prev?.sessionId ?? '') as string,
     step: (i.step ?? prev?.step ?? 'generic') as ApiResponse['step'],
     assistantMessage: (i.assistantMessage ?? prev?.assistantMessage ?? '') as ApiResponse['assistantMessage'],
-    rotation_range: i.rotation_range !== undefined ? i.rotation_range : undefined,
+    rotation_range:
+      i.rotation_range !== undefined
+        ? i.rotation_range
+        : step === 'rotation_range'
+          ? prev?.rotation_range
+          : undefined,
     students,
     modules,
     scheduleTypes: i.scheduleTypes !== undefined ? i.scheduleTypes : prev?.scheduleTypes,
@@ -182,13 +187,15 @@ function mergePartialAiResponse(prev: ApiResponse | null, incoming: Record<strin
     schedule: i.schedule !== undefined ? i.schedule : (prev?.schedule ?? null),
     config: i.config !== undefined ? i.config : prev?.config,
     copymodule:
-      i.copymodule === 'yes' || i.copymodule === 'no'
-        ? i.copymodule
-        : isCopyModulePreviewMessage(String(i.assistantMessage ?? ''))
-          ? 'yes'
-          : incomingHasSchedule && !isScheduleComparePayload(i.schedule as ApiResponse['schedule'])
-            ? 'no'
-            : prev?.copymodule,
+      step === 'rotation_range'
+        ? undefined
+        : i.copymodule === 'yes' || i.copymodule === 'no'
+          ? i.copymodule
+          : isCopyModulePreviewMessage(String(i.assistantMessage ?? ''))
+            ? 'yes'
+            : incomingHasSchedule && !isScheduleComparePayload(i.schedule as ApiResponse['schedule'])
+              ? 'no'
+              : prev?.copymodule,
   };
 }
 
@@ -568,6 +575,24 @@ function buildAssistantChatEntriesFromResponse(data: ApiResponse): Omit<ChatMess
     ];
   }
 
+  if (isRotationRangeEditResponse(data)) {
+    const maxEnd = resolveRotationRangeMaxEnd(data);
+    const range = data.rotation_range;
+    return [
+      {
+        role: 'assistant',
+        picker: {
+          kind: 'rotation_range',
+          frozen: false,
+          intro: rotationRangePickerIntroText(raw),
+          start: String(range?.startRotation ?? data.config?.startRotation ?? 1),
+          end: String(range?.endRotation ?? data.config?.endRotation ?? maxEnd),
+          maxEnd,
+        },
+      },
+    ];
+  }
+
   if (grid && (step === 'schedule' || copyPreview)) {
     const { doneText, assignCheckNotice } = splitDoneAndAssignCheckNotice(raw);
     const copymodule = copyPreview ? 'yes' : data.copymodule;
@@ -648,24 +673,6 @@ function buildAssistantChatEntriesFromResponse(data: ApiResponse): Omit<ChatMess
       ];
     }
     return [modulePickerEntry];
-  }
-
-  if (isRotationRangeEditResponse(data)) {
-    const maxEnd = resolveRotationRangeMaxEnd(data);
-    const range = data.rotation_range;
-    return [
-      {
-        role: 'assistant',
-        picker: {
-          kind: 'rotation_range',
-          frozen: false,
-          intro: rotationRangePickerIntroText(raw),
-          start: String(range?.startRotation ?? data.config?.startRotation ?? 1),
-          end: String(range?.endRotation ?? data.config?.endRotation ?? maxEnd),
-          maxEnd,
-        },
-      },
-    ];
   }
 
   if (!raw) {
@@ -1513,7 +1520,7 @@ export default function App() {
     if (!response) {
       return;
     }
-    const activeKind = stepToPickerKind(response.step);
+    const activeKind = stepToPickerKind(response);
     setChatMessages((prev) =>
       prev.map((m) => {
         if (!m.picker || m.picker.frozen || m.picker.kind === activeKind) {
@@ -2240,11 +2247,12 @@ export default function App() {
     await sendMessage({ startRotation: start, endRotation: end });
   }
 
-  function stepToPickerKind(step: ResponseStep | undefined): ChatPicker['kind'] | null {
-    if (step === 'schedule_types') return 'schedule_types';
-    if (step === 'modules') return 'modules';
-    if (step === 'students') return 'students';
-    if (step === 'rotation_range') return 'rotation_range';
+  function stepToPickerKind(data: ApiResponse | null): ChatPicker['kind'] | null {
+    if (!data) return null;
+    if (data.step === 'schedule_types') return 'schedule_types';
+    if (data.step === 'modules') return 'modules';
+    if (data.step === 'students') return 'students';
+    if (isRotationRangeEditResponse(data)) return 'rotation_range';
     return null;
   }
 
@@ -2253,7 +2261,7 @@ export default function App() {
     if (!picker) {
       return null;
     }
-    const activeKind = stepToPickerKind(response?.step);
+    const activeKind = stepToPickerKind(response);
     const interactive = !picker.frozen && picker.kind === activeKind && !loading;
 
     if (picker.kind === 'schedule_types') {
