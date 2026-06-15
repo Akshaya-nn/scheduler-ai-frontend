@@ -117,8 +117,11 @@ type ApiResponse = {
     pairStudent?: boolean;
     restrictCrossScheduleModuleRepeat?: boolean;
   };
-  /** Preview schedule without copy rows; user can reply `copy` to rebuild with copy modules. */
-  awaitingCopyModuleReply?: boolean;
+  /**
+   * `yes` — preview fits primary seats only; selected students remain unplaced (show copy action).
+   * `no` — copy rows already used, or every selected student is fully placed.
+   */
+  copymodule?: 'yes' | 'no';
 };
 
 /** Merge a shaped server payload into full client state (server omits unchanged lists). */
@@ -183,15 +186,16 @@ function mergePartialAiResponse(prev: ApiResponse | null, incoming: Record<strin
     selectedModules,
     schedule: i.schedule !== undefined ? i.schedule : (prev?.schedule ?? null),
     config: i.config !== undefined ? i.config : prev?.config,
-    awaitingCopyModuleReply:
+    copymodule:
       step === 'rotation_range'
-        ? false
-        : i.awaitingCopyModuleReply === true
-          ? true
-          : i.awaitingCopyModuleReply === false ||
-              (incomingHasSchedule && !isScheduleComparePayload(i.schedule as ApiResponse['schedule']))
-            ? false
-            : prev?.awaitingCopyModuleReply,
+        ? undefined
+        : i.copymodule === 'yes' || i.copymodule === 'no'
+          ? i.copymodule
+          : isCopyModulePreviewMessage(String(i.assistantMessage ?? ''))
+            ? 'yes'
+            : incomingHasSchedule && !isScheduleComparePayload(i.schedule as ApiResponse['schedule'])
+              ? 'no'
+              : prev?.copymodule,
   };
 }
 
@@ -257,8 +261,8 @@ type ChatMessage = {
   scheduleOptions?: ScheduleComparePayload;
   /** Set when user picks A/B — collapses compare to a single option in place */
   chosenCompareOption?: 'A' | 'B';
-  /** Hint below preview grid: reply "copy" to add copy modules for all students */
-  awaitingCopyModuleReply?: boolean;
+  /** Hint below preview grid when server sent `copymodule: yes` */
+  copymodule?: 'yes' | 'no';
   /** Saved schedule id shown on this bubble after save (in-place, no extra chat line) */
   bubbleSavedScheduleId?: string;
   /** Confirmation line after save (e.g. from API assistantMessage) */
@@ -407,6 +411,13 @@ function isAwaitingModulesTimelineAssistantSurface(raw: string): boolean {
   if (/\bfor rotation 1\b/i.test(t) && /\bstudents\b/i.test(t) && /\bcapacity\b/i.test(t)) {
     return true;
   }
+  if (
+    /\b(couldn'?t seat everyone|not enough seats|too many students for rotation 1|not placed:|already assigned to)\b/i.test(
+      t,
+    )
+  ) {
+    return true;
+  }
   return false;
 }
 
@@ -448,7 +459,7 @@ function modulePickerIntroText(
   const lines: string[] = [];
   if (!looksLikeScheduleTypePrompt && preselectedModuleCount > 0) {
     lines.push(
-      `${preselectedModuleCount} item${preselectedModuleCount === 1 ? '' : 's'} marked Selected are already on your current schedule”keep them checked to retain them, tick more to add, then confirm.`,
+      `${preselectedModuleCount} already on this schedule — keep them checked, add more if needed, then confirm.`,
     );
   }
   if (stripped) {
@@ -498,10 +509,16 @@ function rotationRangePickerIntroText(assistantMessage: string): string {
   return stripped || 'Select the start and end rotation count to update, then confirm.';
 }
 
+function isCopyModulePreviewMessage(text: string): boolean {
+  const t = (text ?? '').trim();
+  if (!t) return false;
+  return /\bwithout copy rows\b/i.test(t) && /\breply copy to seat everyone\b/i.test(t);
+}
+
 function assistantMessageLooksLikeError(text: string): boolean {
   const t = text.trim();
   if (!t) return false;
-  return /\b(cannot fit|could not|invalid|not valid|must fit|error|failed|no active|please (choose|increase|reduce)|widen the range)\b/i.test(
+  return /\b(cannot fit|could not|couldn'?t seat|not enough seats|too many students|invalid|not valid|must fit|not placed:|error|failed|no active|please (choose|increase|reduce)|widen the range|already assigned to)\b/i.test(
     t,
   );
 }
@@ -545,6 +562,8 @@ function buildAssistantChatEntriesFromResponse(data: ApiResponse): Omit<ChatMess
   const compareOptions = pickScheduleCompareFromPayload(data);
   const grid = pickScheduleFromPayload(data);
   const step = data.step;
+  const copyPreview =
+    data.copymodule === 'yes' || (Boolean(grid) && isCopyModulePreviewMessage(raw));
 
   if (step === 'schedule' && compareOptions) {
     return [
@@ -574,16 +593,17 @@ function buildAssistantChatEntriesFromResponse(data: ApiResponse): Omit<ChatMess
     ];
   }
 
-  if (grid && shouldAttachScheduleGridToChat(data, raw)) {
+  if (grid && (step === 'schedule' || copyPreview)) {
     const { doneText, assignCheckNotice } = splitDoneAndAssignCheckNotice(raw);
+    const copymodule = copyPreview ? 'yes' : data.copymodule;
     return [
       {
         role: 'assistant',
-        text: doneText || (data.awaitingCopyModuleReply ? raw : 'Here is your generated schedule.'),
+        text: doneText || (copyPreview ? raw : 'Here is your generated schedule.'),
         ...(assignCheckNotice ? { assignCheckNotice } : {}),
         schedule: grid,
         showSavePrompt: true,
-        ...(data.awaitingCopyModuleReply ? { awaitingCopyModuleReply: true } : {}),
+        ...(copymodule === 'yes' || copymodule === 'no' ? { copymodule } : {}),
       },
     ];
   }
@@ -621,6 +641,27 @@ function buildAssistantChatEntriesFromResponse(data: ApiResponse): Omit<ChatMess
   }
 
   if (step === 'modules') {
+    const modulePickerEntry = {
+      role: 'assistant' as const,
+      picker: {
+        kind: 'modules' as const,
+        frozen: false,
+        intro: modulePickerIntroText(
+          raw,
+          data.selectedModules?.length ?? 0,
+          (data.modules?.length ?? 0) > 0,
+        ),
+        modules: data.modules ?? [],
+        selectedIds: [
+          ...new Set(
+            (data.selectedModules ?? []).map((m) => catalogIdFromExpandedModuleRowId(m.id)),
+          ),
+        ],
+        copyEachModule: false,
+        copyModuleCount: '1',
+        contentLabel: data.selectedScheduleType?.type === 'expedition' ? 'Expedition' : 'Module',
+      },
+    };
     if (isAwaitingModulesTimelineAssistantSurface(raw)) {
       return [
         {
@@ -628,31 +669,10 @@ function buildAssistantChatEntriesFromResponse(data: ApiResponse): Omit<ChatMess
           text: stripNumberedListLines(raw),
           isError: assistantMessageLooksLikeError(raw),
         },
+        modulePickerEntry,
       ];
     }
-    return [
-      {
-        role: 'assistant',
-        picker: {
-          kind: 'modules',
-          frozen: false,
-          intro: modulePickerIntroText(
-            raw,
-            data.selectedModules?.length ?? 0,
-            (data.modules?.length ?? 0) > 0,
-          ),
-          modules: data.modules ?? [],
-          selectedIds: [
-            ...new Set(
-              (data.selectedModules ?? []).map((m) => catalogIdFromExpandedModuleRowId(m.id)),
-            ),
-          ],
-          copyEachModule: false,
-          copyModuleCount: '1',
-          contentLabel: data.selectedScheduleType?.type === 'expedition' ? 'Expedition' : 'Module',
-        },
-      },
-    ];
+    return [modulePickerEntry];
   }
 
   if (!raw) {
@@ -885,6 +905,10 @@ function filterNewScheduleChatEntries(
     }
     const fp = scheduleFingerprint(entry.schedule);
     if (fp === lastScheduleFingerprintRef.current) {
+      if (entry.copymodule === 'yes') {
+        out.push(entry);
+        continue;
+      }
       if (entry.text?.trim()) {
         out.push({
           role: 'assistant',
@@ -1090,6 +1114,47 @@ function mergePersistedSchedule(data: ApiResponse, previous: SchedulePayload | n
 /** Copy rows expand `selectedModules` with synthetic suffixes; checklist rows use catalog ids. */
 function catalogIdFromExpandedModuleRowId(id: string): string {
   return id.replace(/::__copy_\d+(?:_\d+)?$/i, '');
+}
+
+function normalizeModuleCatalogIds(ids: string[]): string[] {
+  return Array.from(new Set(ids.map((id) => catalogIdFromExpandedModuleRowId(id.trim())).filter((id) => id.length > 0)));
+}
+
+function resolveModuleCatalogIdsForAssignCheck(
+  resp: ApiResponse | null,
+  modulePayloadIds?: string[],
+): string[] {
+  if (modulePayloadIds && modulePayloadIds.length > 0) {
+    return normalizeModuleCatalogIds(modulePayloadIds);
+  }
+  if ((resp?.selectedModules?.length ?? 0) > 0) {
+    return normalizeModuleCatalogIds((resp?.selectedModules ?? []).map((module) => module.id));
+  }
+  return [];
+}
+
+/** Call `student/assign/check` before turns that can generate or regenerate the grid. */
+function shouldRunAssignCheckBeforeSend(
+  payload:
+    | string
+    | { moduleIds: string[] }
+    | { studentIds: string[] }
+    | { startRotation: number; endRotation: number },
+  moduleCatalogIds: string[],
+): boolean {
+  if (moduleCatalogIds.length === 0) {
+    return false;
+  }
+  if (typeof payload !== 'string' && 'moduleIds' in payload) {
+    return true;
+  }
+  if (typeof payload !== 'string' && 'startRotation' in payload && 'endRotation' in payload) {
+    return true;
+  }
+  if (typeof payload === 'string') {
+    return /start rotation exactly/i.test(payload) || /end rotation exactly/i.test(payload);
+  }
+  return false;
 }
 
 type SaveModalRequest = {
@@ -1338,6 +1403,13 @@ export default function App() {
   ]);
 
   const chatThreadRef = useRef<HTMLDivElement>(null);
+  /**
+   * Student ids sent to `student/assign/check` on module confirm.
+   * `['all']` until the user confirms the student checklist; then the confirmed selection.
+   */
+  const assignCheckStudentIdsRef = useRef<string[]>(['all']);
+  /** Set when the user confirms the student checklist or sends structured studentIds. */
+  const studentRosterTouchedRef = useRef(false);
   /** Skip duplicate schedule cards in chat when the grid unchanged. */
   const lastChatScheduleFingerprintRef = useRef<string | null>(null);
   /** Tracks A/B click while the compare API round-trip is in flight */
@@ -1564,6 +1636,31 @@ export default function App() {
         return prev;
       }
 
+      const copyScheduleEntry = toAdd.find((entry) => entry.schedule && entry.copymodule !== 'yes');
+      if (copyScheduleEntry?.schedule && prev.some((m) => m.copymodule === 'yes' && m.schedule)) {
+        let previewReplaced = false;
+        const base = prev.flatMap((message) => {
+          if (message.copymodule === 'yes' && message.schedule) {
+            if (!previewReplaced) {
+              previewReplaced = true;
+              return [
+                {
+                  ...message,
+                  ...copyScheduleEntry,
+                  id: message.id,
+                  copymodule: copyScheduleEntry.copymodule ?? 'no',
+                },
+              ];
+            }
+            return [];
+          }
+          return [message];
+        });
+        lastChatScheduleFingerprintRef.current = scheduleFingerprint(copyScheduleEntry.schedule);
+        const remainder = toAdd.filter((entry) => entry !== copyScheduleEntry);
+        return remainder.length > 0 ? [...base, ...remainder] : base;
+      }
+
       return [...prev, ...toAdd];
     });
   }, []);
@@ -1640,6 +1737,23 @@ export default function App() {
     }
     setStudentSelection((response.selectedStudents ?? []).map((s) => s.id));
   }, [response?.sessionId, response?.step, selectedStudentIdsSig]);
+
+  /** After a roster update, keep assign-check studentIds aligned with the server selection. */
+  useEffect(() => {
+    if (!response?.sessionId || !studentRosterTouchedRef.current) {
+      return;
+    }
+    const selectedIds = Array.from(
+      new Set(
+        (response.selectedStudents ?? [])
+          .map((student) => student.id.trim())
+          .filter((id) => id.length > 0),
+      ),
+    );
+    if (selectedIds.length > 0) {
+      assignCheckStudentIdsRef.current = selectedIds;
+    }
+  }, [response?.sessionId, selectedStudentIdsSig]);
 
   /** Reset the schedule-type radio selection whenever the list or step changes. */
   const scheduleTypesSig = (response?.scheduleTypes ?? []).map((t) => t.id).join('|');
@@ -1857,6 +1971,8 @@ export default function App() {
       setPersistedSchedule(mergePersistedSchedule(data, null));
       setStudentSelection([]);
       setModuleSelection([]);
+      assignCheckStudentIdsRef.current = ['all'];
+      studentRosterTouchedRef.current = false;
       setCopyEachModule(false);
       setCopyModuleCount('1');
       appendAssistantEntriesFromResponse(data);
@@ -1919,6 +2035,11 @@ export default function App() {
     const activeSessionId = sessionId;
     if (!activeSessionId) return false;
 
+    if (typeof payload !== 'string' && 'studentIds' in payload) {
+      assignCheckStudentIdsRef.current = [...payload.studentIds];
+      studentRosterTouchedRef.current = true;
+    }
+
     setLoading(true);
     setError('');
     try {
@@ -1971,6 +2092,8 @@ export default function App() {
     setSavedScheduleId(null);
     setStudentSelection([]);
     setModuleSelection([]);
+    assignCheckStudentIdsRef.current = ['all'];
+    studentRosterTouchedRef.current = false;
     setScheduleTypeSelection('');
     setCopyEachModule(false);
     setCopyModuleCount('1');
@@ -2074,6 +2197,8 @@ export default function App() {
       p.kind === 'students' ? { ...p, frozen: true, selectedIds: [...studentSelection] } : p,
     );
     appendUserSelection(`Selected students (${names.length})`, names);
+    studentRosterTouchedRef.current = true;
+    assignCheckStudentIdsRef.current = [...studentSelection];
     await sendMessage({ studentIds: [...studentSelection] });
   }
 
@@ -2528,7 +2653,7 @@ export default function App() {
                 : undefined
             }
           />
-          {message.awaitingCopyModuleReply && (
+          {message.copymodule === 'yes' && (
             <div className="copy-module-reply-hint" role="note">
               <p className="copy-module-reply-hint-title">Need every student on the schedule?</p>
               <p className="copy-module-reply-hint-body">
