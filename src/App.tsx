@@ -574,7 +574,7 @@ function buildAssistantChatEntriesFromResponse(data: ApiResponse): Omit<ChatMess
     ];
   }
 
-  if (grid && step === 'schedule') {
+  if (grid && shouldAttachScheduleGridToChat(data, raw)) {
     const { doneText, assignCheckNotice } = splitDoneAndAssignCheckNotice(raw);
     return [
       {
@@ -820,6 +820,30 @@ function isScheduleDoneAckText(text?: string): boolean {
     return false;
   }
   return /\bDone\b/i.test(text) || /\bschedule updated\b/i.test(text);
+}
+
+/** Assistant ack lines that include an updated grid in the same turn. */
+function isScheduleGridUpdateAckText(text?: string): boolean {
+  if (!text?.trim()) {
+    return false;
+  }
+  if (isScheduleDoneAckText(text)) {
+    return true;
+  }
+  return (
+    /\bAdded \d+ rotation/i.test(text) ||
+    /\bRemoved \d+ rotation/i.test(text) ||
+    /\brotation count is now\b/i.test(text) ||
+    /\brotations? \d+ through \d+ are updated\b/i.test(text)
+  );
+}
+
+/** Render an inline grid when the server sent one for a fresh or in-place schedule update. */
+function shouldAttachScheduleGridToChat(data: ApiResponse, raw: string): boolean {
+  if (data.step === 'schedule') {
+    return true;
+  }
+  return isScheduleGridUpdateAckText(raw);
 }
 
 /** Server sent a fresh grid this turn — render schedule bubble + Save. */
@@ -1538,31 +1562,6 @@ export default function App() {
       }
       if (toAdd.length === 0) {
         return prev;
-      }
-
-      const copyScheduleEntry = toAdd.find((entry) => entry.schedule && !entry.awaitingCopyModuleReply);
-      if (copyScheduleEntry?.schedule && prev.some((m) => m.awaitingCopyModuleReply && m.schedule)) {
-        let previewReplaced = false;
-        const base = prev.flatMap((message) => {
-          if (message.awaitingCopyModuleReply && message.schedule) {
-            if (!previewReplaced) {
-              previewReplaced = true;
-              return [
-                {
-                  ...message,
-                  ...copyScheduleEntry,
-                  id: message.id,
-                  awaitingCopyModuleReply: false,
-                },
-              ];
-            }
-            return [];
-          }
-          return [message];
-        });
-        lastChatScheduleFingerprintRef.current = scheduleFingerprint(copyScheduleEntry.schedule);
-        const remainder = toAdd.filter((entry) => entry !== copyScheduleEntry);
-        return remainder.length > 0 ? [...base, ...remainder] : base;
       }
 
       return [...prev, ...toAdd];
