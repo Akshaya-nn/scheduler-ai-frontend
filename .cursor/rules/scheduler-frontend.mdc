@@ -6,6 +6,8 @@ alwaysApply: false
 
 # Scheduler AI frontend (`scheduler-ai-frontend`)
 
+**Conceptual model:** `star-academy-ai-scheduler/docs/conceptual-scheduler-model/mindmap.md` — UI phases and teacher-visible behavior must follow the Scheduling Flow and Output sections.
+
 Backend contract: `star-academy-ai-scheduler/docs/session-contract.md`.
 
 API base: `VITE_AI_API_BASE` (default `http://localhost:8080/v2`).
