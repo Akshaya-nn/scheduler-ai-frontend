@@ -196,7 +196,12 @@ function mergePartialAiResponse(prev: ApiResponse | null, incoming: Record<strin
       i.selectedScheduleType !== undefined ? i.selectedScheduleType : prev?.selectedScheduleType,
     selectedStudents,
     selectedModules,
-    schedule: i.schedule !== undefined ? i.schedule : (prev?.schedule ?? null),
+    schedule:
+      i.schedule !== undefined
+        ? i.schedule
+        : step === 'assistantMessage'
+          ? null
+          : (prev?.schedule ?? null),
     config: i.config !== undefined ? i.config : prev?.config,
     copymodule:
       step === 'rotation_range'
@@ -618,7 +623,7 @@ function buildAssistantChatEntriesFromResponse(data: ApiResponse): Omit<ChatMess
     ];
   }
 
-  if (grid && (step === 'schedule' || copyPreview)) {
+  if (grid && (step === 'schedule' || (copyPreview && step !== 'assistantMessage'))) {
     const { doneText, assignCheckNotice } = splitDoneAndAssignCheckNotice(raw);
     const copymodule = copyPreview ? 'yes' : data.copymodule;
     return [
