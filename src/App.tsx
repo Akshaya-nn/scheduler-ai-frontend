@@ -100,6 +100,11 @@ type ApiResponse = {
   assistantMessage: string | UnassignedStudentsAssistantMessage;
   /** Set after `POST session/save` succeeds. */
   scheduleId?: string;
+  /** Save failed mid-publish; grid remains for retry. */
+  saveFailed?: boolean;
+  saveFailureStep?: 'create_schedule_record' | 'publish_seat_assignments' | 'link_schedule_plan';
+  partialScheduleId?: string;
+  saveRetrySuggested?: boolean;
   rotation_range?: {
     startRotation: number;
     endRotation: number;
@@ -122,6 +127,13 @@ type ApiResponse = {
    * `no` — copy rows already used, or every selected student is fully placed.
    */
   copymodule?: 'yes' | 'no';
+  /** Epoch ms when the in-memory working session expires. */
+  sessionExpiresAt?: number;
+  /** Shown in the last ~10 minutes before expiry. */
+  sessionExpiryWarning?: string;
+  /** Working session removed from server memory after inactivity. */
+  sessionExpired?: boolean;
+  sessionInvalid?: boolean;
 };
 
 /** Merge a shaped server payload into full client state (server omits unchanged lists). */
@@ -196,10 +208,23 @@ function mergePartialAiResponse(prev: ApiResponse | null, incoming: Record<strin
             : incomingHasSchedule && !isScheduleComparePayload(i.schedule as ApiResponse['schedule'])
               ? 'no'
               : prev?.copymodule,
+    sessionExpiresAt:
+      typeof i.sessionExpiresAt === 'number' ? i.sessionExpiresAt : prev?.sessionExpiresAt,
+    sessionExpiryWarning:
+      typeof i.sessionExpiryWarning === 'string'
+        ? i.sessionExpiryWarning
+        : prev?.sessionExpiryWarning,
+    sessionExpired: i.sessionExpired === true ? true : prev?.sessionExpired,
+    sessionInvalid: i.sessionInvalid === true ? true : prev?.sessionInvalid,
   };
 }
 
 const apiBase = import.meta.env.VITE_AI_API_BASE ?? 'http://localhost:8080/v2';
+const SESSION_EXPIRY_WARNING_MS = 10 * 60 * 1000;
+
+function isInactiveSessionLifecyclePayload(payload: Record<string, unknown>): boolean {
+  return payload.sessionExpired === true || payload.sessionInvalid === true;
+}
 
 type ChatPicker =
   | {
@@ -1162,6 +1187,14 @@ type SaveModalRequest = {
   chatMessageId?: string;
 };
 
+type UnplacedSaveWarningRequest = {
+  sessionId: string;
+  chatMessageId?: string;
+  scheduleName: string;
+  unplacedStudentNames: string[];
+  assistantMessage: string;
+};
+
 function ScheduleSaveModal({
   scheduleName,
   saving,
@@ -1240,6 +1273,73 @@ function ScheduleSaveModal({
           </button>
           <button className="btn primary" type="button" disabled={!canConfirm} onClick={onConfirm}>
             {saving ? 'Saving…' : 'Confirm'}
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function UnplacedStudentsSaveWarningModal({
+  assistantMessage,
+  unplacedStudentNames,
+  saving,
+  onCancel,
+  onConfirmSave,
+}: {
+  assistantMessage: string;
+  unplacedStudentNames: string[];
+  saving: boolean;
+  onCancel: () => void;
+  onConfirmSave: () => void;
+}) {
+  useEffect(() => {
+    const previousOverflow = document.body.style.overflow;
+    document.body.style.overflow = 'hidden';
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.key === 'Escape' && !saving) {
+        onCancel();
+      }
+    };
+    window.addEventListener('keydown', onKeyDown);
+    return () => {
+      document.body.style.overflow = previousOverflow;
+      window.removeEventListener('keydown', onKeyDown);
+    };
+  }, [onCancel, saving]);
+
+  return (
+    <div className="schedule-save-modal-overlay" role="presentation">
+      <button
+        type="button"
+        className="schedule-save-modal-backdrop"
+        aria-label="Close save warning"
+        disabled={saving}
+        onClick={onCancel}
+      />
+      <div
+        className="schedule-save-modal"
+        role="alertdialog"
+        aria-modal="true"
+        aria-labelledby="unplaced-save-warning-title"
+      >
+        <h2 id="unplaced-save-warning-title" className="schedule-save-modal-title">
+          Unplaced students
+        </h2>
+        <p className="schedule-save-modal-text">{assistantMessage}</p>
+        {unplacedStudentNames.length > 0 && (
+          <ul className="schedule-save-modal-text">
+            {unplacedStudentNames.map((name) => (
+              <li key={name}>{name}</li>
+            ))}
+          </ul>
+        )}
+        <div className="schedule-save-modal-actions">
+          <button className="btn btn-outline" type="button" disabled={saving} onClick={onCancel}>
+            Cancel
+          </button>
+          <button className="btn primary" type="button" disabled={saving} onClick={onConfirmSave}>
+            {saving ? 'Saving…' : 'Save anyway'}
           </button>
         </div>
       </div>
@@ -1392,6 +1492,7 @@ export default function App() {
   const [startRotationSelection, setStartRotationSelection] = useState('1');
   const [endRotationSelection, setEndRotationSelection] = useState('2');
   const [error, setError] = useState('');
+  const [sessionExpiryBanner, setSessionExpiryBanner] = useState('');
   const [savingSchedule, setSavingSchedule] = useState(false);
   const [savedScheduleId, setSavedScheduleId] = useState<string | null>(null);
   const [chatMessages, setChatMessages] = useState<ChatMessage[]>([
@@ -1418,6 +1519,9 @@ export default function App() {
   const [savingMessageId, setSavingMessageId] = useState<string | null>(null);
   const [saveModalRequest, setSaveModalRequest] = useState<SaveModalRequest | null>(null);
   const [saveModalScheduleName, setSaveModalScheduleName] = useState('');
+  const [unplacedSaveWarning, setUnplacedSaveWarning] = useState<UnplacedSaveWarningRequest | null>(
+    null,
+  );
   /** True once the user has reached `completed` with a grid ” used to skip chat auto-scroll during module-edit interrupts. */
   const completedScheduleEverRef = useRef(false);
   /** Avoid double `scrollIntoView` in React Strict Mode for the same bubble. */
@@ -1454,6 +1558,47 @@ export default function App() {
     },
     [appendMessages],
   );
+
+  const clearWorkingSessionForInactiveLifecycle = useCallback(() => {
+    setSessionExpiryBanner('');
+    setSessionId('');
+    setCurrentClassId('');
+    setResponse(null);
+    setPersistedSchedule(null);
+    setSavedScheduleId(null);
+    setStudentSelection([]);
+    setModuleSelection([]);
+    assignCheckStudentIdsRef.current = ['all'];
+    studentRosterTouchedRef.current = false;
+    setScheduleTypeSelection('');
+    setCopyEachModule(false);
+    setCopyModuleCount('1');
+    setChatMode('awaiting_class_id');
+    lastChatScheduleFingerprintRef.current = null;
+    completedScheduleEverRef.current = false;
+    moduleCapacityScrollDoneForMessageIdRef.current = null;
+  }, []);
+
+  useEffect(() => {
+    const expiresAt = response?.sessionExpiresAt;
+    if (!expiresAt || response?.sessionExpired) {
+      return;
+    }
+    const syncBanner = () => {
+      const remaining = expiresAt - Date.now();
+      if (remaining <= 0 || remaining > SESSION_EXPIRY_WARNING_MS) {
+        setSessionExpiryBanner('');
+        return;
+      }
+      setSessionExpiryBanner(
+        response.sessionExpiryWarning ??
+          'Your session will expire in about 10 minutes. Save your schedule now to avoid losing your work.',
+      );
+    };
+    syncBanner();
+    const timer = window.setInterval(syncBanner, 30_000);
+    return () => window.clearInterval(timer);
+  }, [response?.sessionExpiresAt, response?.sessionExpiryWarning, response?.sessionExpired]);
 
   const loadSessionHistoryFromUrl = useCallback(async (targetSessionId: string) => {
     setSharedSessionLoading(true);
@@ -1846,16 +1991,26 @@ export default function App() {
     setSaveModalScheduleName('');
   }
 
+  function closeUnplacedSaveWarningModal() {
+    if (savingSchedule) {
+      return;
+    }
+    setUnplacedSaveWarning(null);
+  }
+
   async function saveCurrentSchedule(
     targetSessionId: string,
     chatMessageId?: string,
     scheduleName?: string,
+    options?: { confirmUnplacedStudentsSave?: boolean },
   ) {
     if (chatMessageId) {
       setSavingMessageId(chatMessageId);
     }
     setSavingSchedule(true);
     setError('');
+    let pendingUnplacedWarning: UnplacedSaveWarningRequest | null = null;
+    let saveSucceeded = false;
     try {
       const controller = new AbortController();
       const saveTimeoutMs = 15 * 60 * 1000;
@@ -1866,6 +2021,7 @@ export default function App() {
         body: JSON.stringify({
           sessionId: targetSessionId,
           ...(scheduleName?.trim() ? { scheduleName: scheduleName.trim() } : {}),
+          ...(options?.confirmUnplacedStudentsSave ? { confirmUnplacedStudentsSave: true } : {}),
         }),
         signal: controller.signal,
       });
@@ -1878,6 +2034,54 @@ export default function App() {
           (typeof raw.message === 'string' && raw.message) ||
           'Save failed';
         throw new Error(errMsg);
+      }
+      if (isInactiveSessionLifecyclePayload(unwrapped)) {
+        const assistantText =
+          typeof unwrapped.assistantMessage === 'string'
+            ? unwrapped.assistantMessage
+            : 'That session is no longer active.';
+        clearWorkingSessionForInactiveLifecycle();
+        appendMessages([{ role: 'assistant', text: assistantText }]);
+        return;
+      }
+      if (unwrapped.requiresUnplacedStudentsSaveConfirmation === true) {
+        const unplacedStudentNames = Array.isArray(unwrapped.unplacedStudentNames)
+          ? unwrapped.unplacedStudentNames.filter(
+              (name): name is string => typeof name === 'string' && name.trim().length > 0,
+            )
+          : [];
+        const assistantMessage =
+          typeof unwrapped.assistantMessage === 'string' && unwrapped.assistantMessage.trim()
+            ? unwrapped.assistantMessage.trim()
+            : 'Some selected students are not on the grid. Save anyway?';
+        pendingUnplacedWarning = {
+          sessionId: targetSessionId,
+          chatMessageId,
+          scheduleName: scheduleName?.trim() ?? '',
+          unplacedStudentNames,
+          assistantMessage,
+        };
+        return;
+      }
+      if (unwrapped.saveFailed === true) {
+        const assistantMessage =
+          typeof unwrapped.assistantMessage === 'string' && unwrapped.assistantMessage.trim()
+            ? unwrapped.assistantMessage.trim()
+            : 'Something went wrong while saving. Your work is still here. Want to try again?';
+        setResponse((prev) =>
+          prev
+            ? mergePartialAiResponse(prev, {
+                step: 'completed',
+                assistantMessage,
+                schedule:
+                  unwrapped.schedule !== undefined && unwrapped.schedule !== null
+                    ? (unwrapped.schedule as ApiResponse['schedule'])
+                    : prev.schedule,
+              })
+            : null,
+        );
+        appendMessages([{ role: 'assistant', text: assistantMessage, isError: true }]);
+        return;
       }
       const scheduleId =
         typeof unwrapped.scheduleId === 'string' ? unwrapped.scheduleId : '';
@@ -1914,20 +2118,30 @@ export default function App() {
       } else {
         appendMessages([{ role: 'assistant', text: saveSuccessMessage }]);
       }
+      saveSucceeded = true;
     } catch (e) {
       const msg =
         e instanceof Error && e.name === 'AbortError'
-          ? 'Save timed out after 15 minutes. The schedule may still be saving on the server — check Star Academy or server logs ([session/save]).'
+          ? 'Save timed out after 15 minutes. The schedule may still be saving on the server — check Star Academy or server logs ([session/save]). Your work is still here. Want to try again?'
           : e instanceof Error
             ? e.message
             : 'Save failed';
       setError(msg);
-      appendMessages([{ role: 'assistant', text: `Something went wrong: ${msg}`, isError: true }]);
+      const retryHint =
+        msg.includes('Your work is still here') ? msg : `${msg}\n\nYour work is still here. Want to try again?`;
+      appendMessages([{ role: 'assistant', text: retryHint, isError: true }]);
     } finally {
       setSavingSchedule(false);
       setSavingMessageId(null);
-      setSaveModalRequest(null);
-      setSaveModalScheduleName('');
+      if (pendingUnplacedWarning) {
+        setSaveModalRequest(null);
+        setSaveModalScheduleName('');
+        setUnplacedSaveWarning(pendingUnplacedWarning);
+      } else if (saveSucceeded) {
+        setSaveModalRequest(null);
+        setSaveModalScheduleName('');
+        setUnplacedSaveWarning(null);
+      }
     }
   }
 
@@ -1940,6 +2154,18 @@ export default function App() {
       return;
     }
     void saveCurrentSchedule(saveModalRequest.sessionId, saveModalRequest.chatMessageId, trimmedName);
+  }
+
+  function confirmUnplacedSaveAnyway() {
+    if (!unplacedSaveWarning) {
+      return;
+    }
+    void saveCurrentSchedule(
+      unplacedSaveWarning.sessionId,
+      unplacedSaveWarning.chatMessageId,
+      unplacedSaveWarning.scheduleName,
+      { confirmUnplacedStudentsSave: true },
+    );
   }
 
   async function startSession(classId: string, initialMessage?: string) {
@@ -1958,15 +2184,27 @@ export default function App() {
       });
       const raw = (await res.json()) as Record<string, unknown>;
       const unwrapped = unwrapAiRotationalPayload(raw) as Record<string, unknown>;
-      const data = mergePartialAiResponse(null, unwrapped);
       if (!res.ok) {
         throw new Error(
           String((raw as { message?: string }).message ?? (unwrapped as { message?: string }).message ?? 'Failed to start session'),
         );
       }
+      if (isInactiveSessionLifecyclePayload(unwrapped)) {
+        clearWorkingSessionForInactiveLifecycle();
+        const assistantText =
+          typeof unwrapped.assistantMessage === 'string'
+            ? unwrapped.assistantMessage
+            : 'That session is no longer active.';
+        appendMessages([{ role: 'assistant', text: assistantText }]);
+        return;
+      }
+      const data = mergePartialAiResponse(null, unwrapped);
       setResponse(data);
       setSessionId(data.sessionId);
       setCurrentClassId(classId);
+      if (typeof data.sessionExpiryWarning === 'string' && data.sessionExpiryWarning.trim()) {
+        setSessionExpiryBanner(data.sessionExpiryWarning);
+      }
       setChatMode('active');
       setPersistedSchedule(mergePersistedSchedule(data, null));
       setStudentSelection([]);
@@ -2056,8 +2294,20 @@ export default function App() {
           String((raw as { message?: string }).message ?? (unwrapped as { message?: string }).message ?? 'Message failed'),
         );
       }
+      if (isInactiveSessionLifecyclePayload(unwrapped)) {
+        const assistantText =
+          typeof unwrapped.assistantMessage === 'string'
+            ? unwrapped.assistantMessage
+            : 'That session is no longer active.';
+        clearWorkingSessionForInactiveLifecycle();
+        appendMessages([{ role: 'assistant', text: assistantText }]);
+        return false;
+      }
       const merged = mergePartialAiResponse(response, unwrapped);
       setResponse(merged);
+      if (typeof merged.sessionExpiryWarning === 'string' && merged.sessionExpiryWarning.trim()) {
+        setSessionExpiryBanner(merged.sessionExpiryWarning);
+      }
       setPersistedSchedule((prev) => mergePersistedSchedule(merged, prev));
       appendAssistantEntriesFromResponse(merged);
       return true;
@@ -2802,6 +3052,12 @@ export default function App() {
           </p>
         ) : null}
 
+        {sessionExpiryBanner ? (
+          <div className="warning session-expiry-banner" role="status">
+            <p>{sessionExpiryBanner}</p>
+          </div>
+        ) : null}
+
         <div ref={chatThreadRef} className="chat-thread" role="log" aria-live="polite">
           {chatMessages.map((message) => {
             const body = renderMessageBody(message);
@@ -2872,6 +3128,15 @@ export default function App() {
           onScheduleNameChange={setSaveModalScheduleName}
           onCancel={closeSaveScheduleModal}
           onConfirm={confirmSaveScheduleModal}
+        />
+      )}
+      {unplacedSaveWarning && (
+        <UnplacedStudentsSaveWarningModal
+          assistantMessage={unplacedSaveWarning.assistantMessage}
+          unplacedStudentNames={unplacedSaveWarning.unplacedStudentNames}
+          saving={savingSchedule}
+          onCancel={closeUnplacedSaveWarningModal}
+          onConfirmSave={confirmUnplacedSaveAnyway}
         />
       )}
     </main>
