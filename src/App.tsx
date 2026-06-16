@@ -68,7 +68,7 @@ type ScheduleComparePayload = {
 
 /** Public API `step` ” what the client should show next (matches server `SelectionStep`). */
 type ResponseStep =
-  | 'schedule_types'
+  | 'scheduleTypes'
   | 'modules'
   | 'students'
   | 'rotation_range'
@@ -139,11 +139,11 @@ function mergePartialAiResponse(prev: ApiResponse | null, incoming: Record<strin
     i.scheduleTypes !== undefined &&
     Array.isArray(i.scheduleTypes) &&
     i.scheduleTypes.length > 0 &&
-    step === 'schedule_types'
+    step === 'scheduleTypes'
   ) {
     modules = [];
   }
-  const scheduleTypeListActive = step === 'schedule_types';
+  const scheduleTypeListActive = step === 'scheduleTypes';
   const scheduleTypeChanged =
     i.selectedScheduleType != null &&
     prev?.selectedScheduleType?.type !== undefined &&
@@ -208,7 +208,7 @@ const apiBase = import.meta.env.VITE_AI_API_BASE ?? 'http://localhost:8080/v2';
 
 type ChatPicker =
   | {
-      kind: 'schedule_types';
+      kind: 'scheduleTypes';
       frozen: boolean;
       intro: string[];
       options: ScheduleTypeItem[];
@@ -394,7 +394,7 @@ function isScheduleTypeRetryMessage(assistantMessage: string): boolean {
 }
 
 /**
- * When step is `modules` or `schedule_types`, most assistant text is only shown inside the inline picker.
+ * When step is `modules` or `scheduleTypes`, most assistant text is only shown inside the inline picker.
  * Capacity / validation replies must also appear as timeline bubbles so the flow reads
  * user â†’ assistant â†’ user, not several user rows with no visible reply.
  */
@@ -628,7 +628,7 @@ function buildAssistantChatEntriesFromResponse(data: ApiResponse): Omit<ChatMess
     ];
   }
 
-  if (step === 'schedule_types') {
+  if (step === 'scheduleTypes') {
     if (isScheduleTypeRetryMessage(raw)) {
       return [{ role: 'assistant', text: stripNumberedListLines(raw), isError: true }];
     }
@@ -636,7 +636,7 @@ function buildAssistantChatEntriesFromResponse(data: ApiResponse): Omit<ChatMess
       {
         role: 'assistant',
         picker: {
-          kind: 'schedule_types',
+          kind: 'scheduleTypes',
           frozen: false,
           intro: scheduleTypePickerIntroText(raw),
           options: data.scheduleTypes ?? [],
@@ -888,7 +888,7 @@ function shouldRetainPersistedSchedule(step: ApiResponse['step'] | undefined): b
     step === 'completed' ||
     step === 'assistantMessage' ||
     step === 'modules' ||
-    step === 'schedule_types' ||
+    step === 'scheduleTypes' ||
     step === 'students' ||
     step === 'rotation_count' ||
     step === 'rotation_range' ||
@@ -1556,7 +1556,7 @@ export default function App() {
           return m;
         }
         const p = m.picker;
-        if (p.kind === 'schedule_types') {
+        if (p.kind === 'scheduleTypes') {
           return {
             ...m,
             picker: { ...p, frozen: true, selectedId: scheduleTypeSelection || p.selectedId },
@@ -2208,14 +2208,14 @@ export default function App() {
   }
 
   async function confirmScheduleTypeSelection() {
-    if (!response || response.step !== 'schedule_types') return;
+    if (!response || response.step !== 'scheduleTypes') return;
     if (loading) return;
     const pickedId = scheduleTypeSelection;
     if (!pickedId) return;
     const picked = (response.scheduleTypes ?? []).find((t) => t.id === pickedId);
     if (!picked) return;
-    freezePickerInChat('schedule_types', (p) =>
-      p.kind === 'schedule_types' ? { ...p, frozen: true, selectedId: pickedId } : p,
+    freezePickerInChat('scheduleTypes', (p) =>
+      p.kind === 'scheduleTypes' ? { ...p, frozen: true, selectedId: pickedId } : p,
     );
     appendUserText(picked.name);
     await sendMessage(picked.name);
@@ -2278,7 +2278,7 @@ export default function App() {
 
   function stepToPickerKind(data: ApiResponse | null): ChatPicker['kind'] | null {
     if (!data) return null;
-    if (data.step === 'schedule_types') return 'schedule_types';
+    if (data.step === 'scheduleTypes') return 'scheduleTypes';
     if (data.step === 'modules') return 'modules';
     if (data.step === 'students') return 'students';
     if (isRotationRangeEditResponse(data)) return 'rotation_range';
@@ -2293,7 +2293,7 @@ export default function App() {
     const activeKind = stepToPickerKind(response);
     const interactive = !picker.frozen && picker.kind === activeKind && !loading;
 
-    if (picker.kind === 'schedule_types') {
+    if (picker.kind === 'scheduleTypes') {
       const selectedId = interactive ? scheduleTypeSelection : (picker.selectedId ?? '');
       return (
         <div className={`bubble-embed-unified${picker.frozen ? ' bubble-embed-frozen' : ''}`}>
