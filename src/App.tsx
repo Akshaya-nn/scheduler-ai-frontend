@@ -1,4 +1,4 @@
-import { FormEvent, Fragment, useCallback, useEffect, useRef, useState } from 'react';
+import { FormEvent, Fragment, useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
   isUsageHelpMessage,
   resolveConversationalReply,
@@ -75,10 +75,33 @@ type ResponseStep =
   | 'rotation_count'
   | 'assistantMessage'
   | 'rotation_capacity'
-  | 'pairing'
   | 'schedule'
   | 'completed'
   | 'generic';
+
+const RECOGNIZED_RESPONSE_STEPS: readonly ResponseStep[] = [
+  'schedule_types',
+  'modules',
+  'students',
+  'rotation_range',
+  'rotation_count',
+  'assistantMessage',
+  'rotation_capacity',
+  'schedule',
+  'completed',
+  'generic',
+];
+
+const UNRECOGNIZED_STEP_FALLBACK_MESSAGE =
+  'Something unexpected happened. Your work is still here — you can continue editing or save your schedule.';
+
+function isRecognizedResponseStep(step: unknown): step is ResponseStep {
+  return typeof step === 'string' && (RECOGNIZED_RESPONSE_STEPS as readonly string[]).includes(step);
+}
+
+function isUnrecognizedResponseStep(step: unknown): boolean {
+  return typeof step === 'string' && step.length > 0 && !isRecognizedResponseStep(step);
+}
 
 const UNASSIGNED_PRIOR_SECTION_KEY = 'Already assigned in earlier schedules:';
 const UNASSIGNED_NO_SLOT_SECTION_KEY = 'Not filled due to no available slots:';
@@ -127,6 +150,8 @@ type ApiResponse = {
    * `no` — copy rows already used, or every selected student is fully placed.
    */
   copymodule?: 'yes' | 'no';
+  /** Non-blocking warnings when required student pairs were not fully honored. */
+  requiredPairWarnings?: string[];
   /** Epoch ms when the in-memory working session expires. */
   sessionExpiresAt?: number;
   /** Shown in the last ~10 minutes before expiry. */
@@ -134,6 +159,14 @@ type ApiResponse = {
   /** Working session removed from server memory after inactivity. */
   sessionExpired?: boolean;
   sessionInvalid?: boolean;
+  /** Server is waiting for a copy / keep-preview reply on the module-copy preview grid. */
+  awaitingCopyModuleReply?: boolean;
+  /** Prior-assignment lookup failed; reply yes/no before generation proceeds. */
+  awaitingPriorAssignCheckProceed?: boolean;
+  /** Duplicate roster names; reply with the numbered pick from the assistant list. */
+  awaitingStudentNameDisambiguation?: boolean;
+  /** Checklist change on a completed grid; reply yes/no before regenerating. */
+  awaitingCompletedChecklistRegeneration?: 'students' | 'modules';
 };
 
 /** Merge a shaped server payload into full client state (server omits unchanged lists). */
@@ -208,11 +241,28 @@ function mergePartialAiResponse(prev: ApiResponse | null, incoming: Record<strin
         ? undefined
         : i.copymodule === 'yes' || i.copymodule === 'no'
           ? i.copymodule
-          : isCopyModulePreviewMessage(String(i.assistantMessage ?? ''))
+          : i.awaitingCopyModuleReply === true
             ? 'yes'
-            : incomingHasSchedule && !isScheduleComparePayload(i.schedule as ApiResponse['schedule'])
+            : i.awaitingCopyModuleReply === false &&
+                incomingHasSchedule &&
+                !isScheduleComparePayload(i.schedule as ApiResponse['schedule'])
               ? 'no'
               : prev?.copymodule,
+    requiredPairWarnings:
+      i.requiredPairWarnings !== undefined ? i.requiredPairWarnings : prev?.requiredPairWarnings,
+    awaitingCopyModuleReply:
+      i.awaitingCopyModuleReply === true
+        ? true
+        : i.awaitingCopyModuleReply === false
+          ? false
+          : prev?.awaitingCopyModuleReply,
+    awaitingPriorAssignCheckProceed: i.awaitingPriorAssignCheckProceed === true,
+    awaitingStudentNameDisambiguation: i.awaitingStudentNameDisambiguation === true,
+    awaitingCompletedChecklistRegeneration:
+      i.awaitingCompletedChecklistRegeneration === 'students' ||
+      i.awaitingCompletedChecklistRegeneration === 'modules'
+        ? i.awaitingCompletedChecklistRegeneration
+        : undefined,
     sessionExpiresAt:
       typeof i.sessionExpiresAt === 'number' ? i.sessionExpiresAt : prev?.sessionExpiresAt,
     sessionExpiryWarning:
@@ -226,6 +276,8 @@ function mergePartialAiResponse(prev: ApiResponse | null, incoming: Record<strin
 
 const apiBase = import.meta.env.VITE_AI_API_BASE ?? 'http://localhost:8080/v2';
 const SESSION_EXPIRY_WARNING_MS = 10 * 60 * 1000;
+const CLIENT_SESSION_EXPIRED_MESSAGE =
+  'Your session has expired. Start a new session with your class ID to continue.';
 
 function isInactiveSessionLifecyclePayload(payload: Record<string, unknown>): boolean {
   return payload.sessionExpired === true || payload.sessionInvalid === true;
@@ -293,12 +345,18 @@ type ChatMessage = {
   chosenCompareOption?: 'A' | 'B';
   /** Hint below preview grid when server sent `copymodule: yes` */
   copymodule?: 'yes' | 'no';
+  /** Warning section shown below the grid when required pairs were not fully honored. */
+  requiredPairWarnings?: string[];
   /** Saved schedule id shown on this bubble after save (in-place, no extra chat line) */
   bubbleSavedScheduleId?: string;
   /** Confirmation line after save (e.g. from API assistantMessage) */
   saveSuccessMessage?: string;
   /** Inline checklist / picker (single assistant bubble ” no duplicate text above) */
   picker?: ChatPicker;
+  /** One-tap replies for explicit pending-state flags from the API. */
+  quickReplies?: Array<{ label: string; message: string }>;
+  /** Short hint when the teacher must answer in chat (e.g. numbered name pick). */
+  pendingStateHint?: string;
 };
 
 type ChatMode = 'awaiting_intent' | 'awaiting_class_id' | 'active';
@@ -545,6 +603,75 @@ function isCopyModulePreviewMessage(text: string): boolean {
   return /\bwithout copy rows\b/i.test(t) && /\breply copy to seat everyone\b/i.test(t);
 }
 
+function shouldOfferCopyModuleHint(data: ApiResponse, raw: string, grid: SchedulePayload | null): boolean {
+  if (data.awaitingCopyModuleReply === true) {
+    return true;
+  }
+  if (data.awaitingCopyModuleReply === false) {
+    return false;
+  }
+  if (data.copymodule === 'yes') {
+    return true;
+  }
+  return Boolean(grid) && isCopyModulePreviewMessage(raw);
+}
+
+type PendingQuickReply = { label: string; message: string };
+
+function resolvePendingQuickReplies(data: ApiResponse): PendingQuickReply[] {
+  if (data.awaitingPriorAssignCheckProceed) {
+    return [
+      { label: 'Yes, proceed', message: 'yes' },
+      { label: 'No, cancel', message: 'no' },
+    ];
+  }
+  if (data.awaitingCompletedChecklistRegeneration) {
+    return [
+      { label: 'Yes, regenerate', message: 'yes' },
+      { label: 'No, keep current', message: 'no' },
+    ];
+  }
+  return [];
+}
+
+function resolvePendingStateHint(data: ApiResponse): string | undefined {
+  if (data.awaitingStudentNameDisambiguation) {
+    return 'Reply with the list number (1, 2, …) for the student you meant.';
+  }
+  return undefined;
+}
+
+function attachPendingStateUiToEntries(
+  data: ApiResponse,
+  entries: Omit<ChatMessage, 'id'>[],
+): Omit<ChatMessage, 'id'>[] {
+  const quickReplies = resolvePendingQuickReplies(data);
+  const pendingStateHint = resolvePendingStateHint(data);
+  if (quickReplies.length === 0 && !pendingStateHint) {
+    return entries;
+  }
+  if (entries.length === 0) {
+    return [
+      {
+        role: 'assistant',
+        text: typeof data.assistantMessage === 'string' ? data.assistantMessage.trim() : '…',
+        ...(quickReplies.length > 0 ? { quickReplies } : {}),
+        ...(pendingStateHint ? { pendingStateHint } : {}),
+      },
+    ];
+  }
+  const lastIdx = entries.length - 1;
+  return entries.map((entry, index) =>
+    index === lastIdx
+      ? {
+          ...entry,
+          ...(quickReplies.length > 0 ? { quickReplies } : {}),
+          ...(pendingStateHint ? { pendingStateHint } : {}),
+        }
+      : entry,
+  );
+}
+
 function assistantMessageLooksLikeError(text: string): boolean {
   const t = text.trim();
   if (!t) return false;
@@ -583,7 +710,10 @@ function isUnassignedAssistantMessage(
 }
 
 /** Every API turn appends assistant content to the chat timeline (lists/errors stay in thread). */
-function buildAssistantChatEntriesFromResponse(data: ApiResponse): Omit<ChatMessage, 'id'>[] {
+function buildAssistantChatEntriesFromResponse(
+  data: ApiResponse,
+  persistedGrid?: SchedulePayload | null,
+): Omit<ChatMessage, 'id'>[] {
   if (isUnassignedAssistantMessage(data.assistantMessage)) {
     return [{ role: 'assistant', unassignedAssistantMessage: data.assistantMessage }];
   }
@@ -592,8 +722,24 @@ function buildAssistantChatEntriesFromResponse(data: ApiResponse): Omit<ChatMess
   const compareOptions = pickScheduleCompareFromPayload(data);
   const grid = pickScheduleFromPayload(data);
   const step = data.step;
-  const copyPreview =
-    data.copymodule === 'yes' || (Boolean(grid) && isCopyModulePreviewMessage(raw));
+  const copyPreview = shouldOfferCopyModuleHint(data, raw, grid);
+
+  if (isUnrecognizedResponseStep(step)) {
+    console.warn('[ai-rotational] Unrecognized response step; using safe fallback UI.', {
+      step,
+      sessionId: data.sessionId,
+    });
+    const visibleGrid = grid ?? persistedGrid ?? null;
+    return [
+      {
+        role: 'assistant',
+        text: UNRECOGNIZED_STEP_FALLBACK_MESSAGE,
+        ...(visibleGrid
+          ? { schedule: visibleGrid, showSavePrompt: true as const }
+          : {}),
+      },
+    ];
+  }
 
   if (step === 'schedule' && compareOptions) {
     return [
@@ -626,6 +772,9 @@ function buildAssistantChatEntriesFromResponse(data: ApiResponse): Omit<ChatMess
   if (grid && (step === 'schedule' || (copyPreview && step !== 'assistantMessage'))) {
     const { doneText, assignCheckNotice } = splitDoneAndAssignCheckNotice(raw);
     const copymodule = copyPreview ? 'yes' : data.copymodule;
+    const requiredPairWarnings = Array.isArray(data.requiredPairWarnings)
+      ? data.requiredPairWarnings.filter((line) => typeof line === 'string' && line.trim().length > 0)
+      : undefined;
     return [
       {
         role: 'assistant',
@@ -634,6 +783,9 @@ function buildAssistantChatEntriesFromResponse(data: ApiResponse): Omit<ChatMess
         schedule: grid,
         showSavePrompt: true,
         ...(copymodule === 'yes' || copymodule === 'no' ? { copymodule } : {}),
+        ...(requiredPairWarnings && requiredPairWarnings.length > 0
+          ? { requiredPairWarnings }
+          : {}),
       },
     ];
   }
@@ -918,7 +1070,6 @@ function shouldRetainPersistedSchedule(step: ApiResponse['step'] | undefined): b
     step === 'rotation_count' ||
     step === 'rotation_range' ||
     step === 'rotation_capacity' ||
-    step === 'pairing' ||
     step === 'generic'
   );
 }
@@ -1135,7 +1286,7 @@ function mergePersistedSchedule(data: ApiResponse, previous: SchedulePayload | n
   if (picked !== null) {
     return picked;
   }
-  if (shouldRetainPersistedSchedule(data.step)) {
+  if (shouldRetainPersistedSchedule(data.step) || isUnrecognizedResponseStep(data.step)) {
     return previous;
   }
   return null;
@@ -1199,6 +1350,77 @@ type UnplacedSaveWarningRequest = {
   unplacedStudentNames: string[];
   assistantMessage: string;
 };
+
+type PlacementIssuesSaveWarningRequest = {
+  sessionId: string;
+  chatMessageId?: string;
+  scheduleName: string;
+};
+
+type WarningBuckets = {
+  teacherWarnings: string[];
+  telemetryWarnings: string[];
+};
+
+function classifyScheduleWarningsForTeacher(schedule: SchedulePayload): WarningBuckets {
+  const source = Array.isArray(schedule.warnings) ? schedule.warnings : [];
+  const telemetryMatchers = [
+    /\bused\b.+\bpattern\b/i,
+    /\bschedule planner:/i,
+    /\brotation columns are locked to module families\b/i,
+    /\bseat\s*0\b.+\bseat\s*1\b.+\bintentionally empty\b/i,
+    /\bkirkman\b/i,
+    /\bcyclic shift\b/i,
+  ];
+  const teacherMatchers = [
+    /\bstudent(s)?\b/i,
+    /\bcould not be placed\b/i,
+    /\bnot placed\b/i,
+    /\bmissing from\b/i,
+    /\bnot filled\b/i,
+    /\bcoverage\b/i,
+    /\bpair(s|ing)?\b/i,
+    /\brequired pair\b/i,
+    /\bempty\b.+\brotation\b/i,
+    /\brotation\b.+\bempty\b/i,
+    /\bconstraint(s)?\b/i,
+  ];
+
+  const teacherWarnings: string[] = [];
+  const telemetryWarnings: string[] = [];
+  for (const raw of source) {
+    if (typeof raw !== 'string') {
+      continue;
+    }
+    const warning = raw.trim();
+    if (!warning) {
+      continue;
+    }
+    const telemetry = telemetryMatchers.some((re) => re.test(warning));
+    const teacher = teacherMatchers.some((re) => re.test(warning));
+    if (teacher && !telemetry) {
+      teacherWarnings.push(warning);
+    } else {
+      telemetryWarnings.push(warning);
+    }
+  }
+  return { teacherWarnings, telemetryWarnings };
+}
+
+function hasNamedCouldNotBePlacedWarning(schedule: SchedulePayload): boolean {
+  return classifyScheduleWarningsForTeacher(schedule).teacherWarnings.some((warning) => {
+    if (!/could not be placed/i.test(warning)) {
+      return false;
+    }
+    return /:\s*[A-Za-z]/.test(warning) || /,\s*[A-Za-z]/.test(warning);
+  });
+}
+
+function shouldRequirePlacementIssuesSaveConfirmation(message: ChatMessage): boolean {
+  const scheduleGate = message.schedule ? hasNamedCouldNotBePlacedWarning(message.schedule) : false;
+  const requiredPairGate = !!message.requiredPairWarnings && message.requiredPairWarnings.length > 0;
+  return scheduleGate || requiredPairGate;
+}
 
 function ScheduleSaveModal({
   scheduleName,
@@ -1352,6 +1574,64 @@ function UnplacedStudentsSaveWarningModal({
   );
 }
 
+function PlacementIssuesSaveWarningModal({
+  saving,
+  onCancel,
+  onConfirmSave,
+}: {
+  saving: boolean;
+  onCancel: () => void;
+  onConfirmSave: () => void;
+}) {
+  useEffect(() => {
+    const previousOverflow = document.body.style.overflow;
+    document.body.style.overflow = 'hidden';
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.key === 'Escape' && !saving) {
+        onCancel();
+      }
+    };
+    window.addEventListener('keydown', onKeyDown);
+    return () => {
+      document.body.style.overflow = previousOverflow;
+      window.removeEventListener('keydown', onKeyDown);
+    };
+  }, [onCancel, saving]);
+
+  return (
+    <div className="schedule-save-modal-overlay" role="presentation">
+      <button
+        type="button"
+        className="schedule-save-modal-backdrop"
+        aria-label="Close placement issues warning"
+        disabled={saving}
+        onClick={onCancel}
+      />
+      <div
+        className="schedule-save-modal"
+        role="alertdialog"
+        aria-modal="true"
+        aria-labelledby="placement-issues-save-warning-title"
+      >
+        <h2 id="placement-issues-save-warning-title" className="schedule-save-modal-title">
+          Placement issues
+        </h2>
+        <p className="schedule-save-modal-text">
+          This schedule has placement issues. Are you sure you want to save?
+        </p>
+        <div className="schedule-save-modal-actions">
+          <button className="btn btn-outline" type="button" disabled={saving} onClick={onCancel}>
+            Cancel
+          </button>
+          <button className="btn primary" type="button" disabled={saving} onClick={onConfirmSave}>
+            {saving ? 'Saving…' : 'Save anyway'}
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
 function ScheduleGridTable({
   schedule,
   scrollable = false,
@@ -1361,7 +1641,7 @@ function ScheduleGridTable({
 }: {
   schedule: SchedulePayload;
   scrollable?: boolean;
-  savePrompt?: { onSave: () => void; saving?: boolean };
+  savePrompt?: { onSave: () => void; saving?: boolean; warningCount?: number };
   /** Inline compact view only — opens dedicated full-page view (not an overlay). */
   showExpandControl?: boolean;
   expandTitle?: string;
@@ -1374,6 +1654,18 @@ function ScheduleGridTable({
       ? Array.from({ length: rowLen }, (_, i) => i)
       : scheduleRowDisplayOrder(schedule);
   const useScroll = scrollable || Boolean(savePrompt);
+  const warningsPanelRef = useRef<HTMLDivElement>(null);
+  const [showAllWarnings, setShowAllWarnings] = useState(false);
+  const warningBuckets = useMemo(() => classifyScheduleWarningsForTeacher(schedule), [schedule]);
+  const teacherWarnings = warningBuckets.teacherWarnings;
+  const telemetryWarnings = warningBuckets.telemetryWarnings;
+  const visibleWarnings = showAllWarnings ? teacherWarnings : teacherWarnings.slice(0, 3);
+
+  useEffect(() => {
+    if (telemetryWarnings.length > 0) {
+      console.info('[scheduler] placement telemetry warnings (hidden from teacher UI):', telemetryWarnings);
+    }
+  }, [telemetryWarnings]);
 
   const openFullPage = () => {
     openScheduleFullView({ schedule, title: expandTitle });
@@ -1430,6 +1722,27 @@ function ScheduleGridTable({
     return (
       <>
         {compactToolbar}
+        {teacherWarnings.length > 0 && (
+          <div className="schedule-warning-panel" role="note" ref={warningsPanelRef}>
+            <p className="schedule-warning-panel-title">Scheduling notes</p>
+            <ul className="bubble-list">
+              {visibleWarnings.map((warning, index) => (
+                <li key={`${index}-${warning}`}>{warning}</li>
+              ))}
+            </ul>
+            {teacherWarnings.length > 3 && (
+              <button
+                type="button"
+                className="schedule-warning-toggle"
+                onClick={() => setShowAllWarnings((prev) => !prev)}
+              >
+                {showAllWarnings
+                  ? 'Show fewer warnings'
+                  : `Show all [${teacherWarnings.length}] warnings`}
+              </button>
+            )}
+          </div>
+        )}
         <div className={`schedule-table-wrap${useScroll ? ' schedule-table-wrap--scroll' : ''}`}>{table}</div>
       </>
     );
@@ -1438,8 +1751,43 @@ function ScheduleGridTable({
   return (
     <div className="schedule-card">
       {compactToolbar}
+      {teacherWarnings.length > 0 && (
+        <div className="schedule-warning-panel" role="note" ref={warningsPanelRef}>
+          <p className="schedule-warning-panel-title">Scheduling notes</p>
+          <ul className="bubble-list">
+            {visibleWarnings.map((warning, index) => (
+              <li key={`${index}-${warning}`}>{warning}</li>
+            ))}
+          </ul>
+          {teacherWarnings.length > 3 && (
+            <button
+              type="button"
+              className="schedule-warning-toggle"
+              onClick={() => setShowAllWarnings((prev) => !prev)}
+            >
+              {showAllWarnings
+                ? 'Show fewer warnings'
+                : `Show all [${teacherWarnings.length}] warnings`}
+            </button>
+          )}
+        </div>
+      )}
       <div className="schedule-table-wrap schedule-table-wrap--scroll">{table}</div>
       <footer className="schedule-save-prompt">
+        {Boolean(savePrompt.warningCount && savePrompt.warningCount > 0) && (
+          <button
+            type="button"
+            className="schedule-save-warning-chip"
+            onClick={() =>
+              warningsPanelRef.current?.scrollIntoView({
+                behavior: 'smooth',
+                block: 'nearest',
+              })
+            }
+          >
+            Review {savePrompt.warningCount} warnings before saving
+          </button>
+        )}
         <button
           className="btn btn-save-schedule"
           type="button"
@@ -1489,6 +1837,7 @@ export default function App() {
   const [response, setResponse] = useState<ApiResponse | null>(null);
   /** Keeps the last generated grid if a later API message omits `schedule`. */
   const [persistedSchedule, setPersistedSchedule] = useState<SchedulePayload | null>(null);
+  const persistedScheduleRef = useRef<SchedulePayload | null>(null);
   const [studentSelection, setStudentSelection] = useState<string[]>([]);
   const [moduleSelection, setModuleSelection] = useState<string[]>([]);
   const [scheduleTypeSelection, setScheduleTypeSelection] = useState<string>('');
@@ -1527,10 +1876,27 @@ export default function App() {
   const [unplacedSaveWarning, setUnplacedSaveWarning] = useState<UnplacedSaveWarningRequest | null>(
     null,
   );
+  const [placementIssuesSaveWarning, setPlacementIssuesSaveWarning] =
+    useState<PlacementIssuesSaveWarningRequest | null>(null);
   /** True once the user has reached `completed` with a grid ” used to skip chat auto-scroll during module-edit interrupts. */
   const completedScheduleEverRef = useRef(false);
   /** Avoid double `scrollIntoView` in React Strict Mode for the same bubble. */
   const moduleCapacityScrollDoneForMessageIdRef = useRef<string | null>(null);
+  /** Mirrors `chatInput` for session-expiry timer without re-subscribing the timer. */
+  const chatInputRef = useRef('');
+  const sessionExpiryTimerRef = useRef<number | null>(null);
+  /** Timer fired while the teacher was composing — show expiry notice on next send. */
+  const deferredClientSessionExpiryRef = useRef(false);
+  /** Proactive client expiry cleared working state; block further API sends until a new session. */
+  const clientSessionExpiredRef = useRef(false);
+
+  useEffect(() => {
+    persistedScheduleRef.current = persistedSchedule;
+  }, [persistedSchedule]);
+
+  useEffect(() => {
+    chatInputRef.current = chatInput;
+  }, [chatInput]);
 
   const appendMessages = useCallback((entries: Omit<ChatMessage, 'id'>[]) => {
     setChatMessages((prev) => [...prev, ...entries.map((e) => ({ ...e, id: nextMessageId() }))]);
@@ -1564,7 +1930,14 @@ export default function App() {
     [appendMessages],
   );
 
-  const clearWorkingSessionForInactiveLifecycle = useCallback(() => {
+  const clearClientSessionExpiryTimer = useCallback(() => {
+    if (sessionExpiryTimerRef.current !== null) {
+      window.clearTimeout(sessionExpiryTimerRef.current);
+      sessionExpiryTimerRef.current = null;
+    }
+  }, []);
+
+  const clearWorkingSessionStateKeepChat = useCallback(() => {
     setSessionExpiryBanner('');
     setSessionId('');
     setCurrentClassId('');
@@ -1583,6 +1956,61 @@ export default function App() {
     completedScheduleEverRef.current = false;
     moduleCapacityScrollDoneForMessageIdRef.current = null;
   }, []);
+
+  const clearWorkingSessionForInactiveLifecycle = useCallback(() => {
+    clearClientSessionExpiryTimer();
+    deferredClientSessionExpiryRef.current = false;
+    clientSessionExpiredRef.current = false;
+    clearWorkingSessionStateKeepChat();
+  }, [clearClientSessionExpiryTimer, clearWorkingSessionStateKeepChat]);
+
+  const handleClientSessionExpiryTimerFire = useCallback(() => {
+    sessionExpiryTimerRef.current = null;
+    clientSessionExpiredRef.current = true;
+    clearWorkingSessionStateKeepChat();
+    const isComposing = chatInputRef.current.trim().length > 0;
+    if (isComposing) {
+      deferredClientSessionExpiryRef.current = true;
+      return;
+    }
+    appendMessages([{ role: 'assistant', text: CLIENT_SESSION_EXPIRED_MESSAGE }]);
+  }, [appendMessages, clearWorkingSessionStateKeepChat]);
+
+  const blockSendIfClientSessionExpired = useCallback((): boolean => {
+    if (deferredClientSessionExpiryRef.current) {
+      deferredClientSessionExpiryRef.current = false;
+      appendMessages([{ role: 'assistant', text: CLIENT_SESSION_EXPIRED_MESSAGE }]);
+      return true;
+    }
+    if (clientSessionExpiredRef.current) {
+      return true;
+    }
+    return false;
+  }, [appendMessages]);
+
+  useEffect(() => {
+    const expiresAt = response?.sessionExpiresAt;
+    clearClientSessionExpiryTimer();
+    if (!expiresAt || response?.sessionExpired) {
+      return clearClientSessionExpiryTimer;
+    }
+    clientSessionExpiredRef.current = false;
+    deferredClientSessionExpiryRef.current = false;
+    const delay = expiresAt - Date.now();
+    if (delay <= 0) {
+      handleClientSessionExpiryTimerFire();
+      return clearClientSessionExpiryTimer;
+    }
+    sessionExpiryTimerRef.current = window.setTimeout(() => {
+      handleClientSessionExpiryTimerFire();
+    }, delay);
+    return clearClientSessionExpiryTimer;
+  }, [
+    response?.sessionExpiresAt,
+    response?.sessionExpired,
+    clearClientSessionExpiryTimer,
+    handleClientSessionExpiryTimerFire,
+  ]);
 
   useEffect(() => {
     const expiresAt = response?.sessionExpiresAt;
@@ -1756,9 +2184,12 @@ export default function App() {
   ]);
 
   const appendAssistantEntriesFromResponse = useCallback((data: ApiResponse) => {
-    const entries = filterNewScheduleChatEntries(
-      buildAssistantChatEntriesFromResponse(data),
-      lastChatScheduleFingerprintRef,
+    const entries = attachPendingStateUiToEntries(
+      data,
+      filterNewScheduleChatEntries(
+        buildAssistantChatEntriesFromResponse(data, persistedScheduleRef.current),
+        lastChatScheduleFingerprintRef,
+      ),
     );
     if (entries.length === 0) {
       return;
@@ -1936,7 +2367,10 @@ export default function App() {
   /** Keep showing the last grid when reopening module/student pick after `completed` (API may omit `schedule` on interrupt steps). */
   const displaySchedule =
     normalizedSchedule ??
-    (response && (shouldRetainPersistedSchedule(response.step) || isRotationRangeEditResponse(response))
+    (response &&
+    (shouldRetainPersistedSchedule(response.step) ||
+      isRotationRangeEditResponse(response) ||
+      isUnrecognizedResponseStep(response.step))
       ? persistedSchedule
       : null);
 
@@ -1969,7 +2403,7 @@ export default function App() {
 
   const canSaveCurrentSchedule =
     Boolean(sessionId) &&
-    isPostGenerationWorkflowStep(response?.step) &&
+    (isPostGenerationWorkflowStep(response?.step) || isUnrecognizedResponseStep(response?.step)) &&
     displaySchedule != null &&
     !savingSchedule &&
     !savedScheduleId &&
@@ -2001,6 +2435,13 @@ export default function App() {
       return;
     }
     setUnplacedSaveWarning(null);
+  }
+
+  function closePlacementIssuesSaveWarningModal() {
+    if (savingSchedule) {
+      return;
+    }
+    setPlacementIssuesSaveWarning(null);
   }
 
   async function saveCurrentSchedule(
@@ -2142,10 +2583,12 @@ export default function App() {
         setSaveModalRequest(null);
         setSaveModalScheduleName('');
         setUnplacedSaveWarning(pendingUnplacedWarning);
+        setPlacementIssuesSaveWarning(null);
       } else if (saveSucceeded) {
         setSaveModalRequest(null);
         setSaveModalScheduleName('');
         setUnplacedSaveWarning(null);
+        setPlacementIssuesSaveWarning(null);
       }
     }
   }
@@ -2156,6 +2599,18 @@ export default function App() {
     }
     const trimmedName = saveModalScheduleName.trim();
     if (!trimmedName) {
+      return;
+    }
+    const saveMessage = saveModalRequest.chatMessageId
+      ? chatMessages.find((message) => message.id === saveModalRequest.chatMessageId)
+      : null;
+    if (saveMessage && shouldRequirePlacementIssuesSaveConfirmation(saveMessage)) {
+      setSaveModalRequest(null);
+      setPlacementIssuesSaveWarning({
+        sessionId: saveModalRequest.sessionId,
+        chatMessageId: saveModalRequest.chatMessageId,
+        scheduleName: trimmedName,
+      });
       return;
     }
     void saveCurrentSchedule(saveModalRequest.sessionId, saveModalRequest.chatMessageId, trimmedName);
@@ -2170,6 +2625,17 @@ export default function App() {
       unplacedSaveWarning.chatMessageId,
       unplacedSaveWarning.scheduleName,
       { confirmUnplacedStudentsSave: true },
+    );
+  }
+
+  function confirmPlacementIssuesSaveAnyway() {
+    if (!placementIssuesSaveWarning) {
+      return;
+    }
+    void saveCurrentSchedule(
+      placementIssuesSaveWarning.sessionId,
+      placementIssuesSaveWarning.chatMessageId,
+      placementIssuesSaveWarning.scheduleName,
     );
   }
 
@@ -2204,6 +2670,8 @@ export default function App() {
         return;
       }
       const data = mergePartialAiResponse(null, unwrapped);
+      clientSessionExpiredRef.current = false;
+      deferredClientSessionExpiryRef.current = false;
       setResponse(data);
       setSessionId(data.sessionId);
       setCurrentClassId(classId);
@@ -2275,6 +2743,9 @@ export default function App() {
   async function sendMessage(
     payload: string | SessionModuleIdsPayload | SessionStudentIdsPayload | SessionRotationRangePayload,
   ): Promise<boolean> {
+    if (blockSendIfClientSessionExpired()) {
+      return false;
+    }
     const activeSessionId = sessionId;
     if (!activeSessionId) return false;
 
@@ -2370,6 +2841,12 @@ export default function App() {
     event.preventDefault();
     const message = chatInput.trim();
     if (!message) {
+      return;
+    }
+    if (deferredClientSessionExpiryRef.current || clientSessionExpiredRef.current) {
+      setChatInput('');
+      appendUserText(message);
+      blockSendIfClientSessionExpired();
       return;
     }
     setChatInput('');
@@ -2904,10 +3381,21 @@ export default function App() {
                 ? {
                     onSave: () => openSaveScheduleModal(sessionId, message.id),
                     saving: savingSchedule && savingMessageId === message.id,
+                    warningCount: classifyScheduleWarningsForTeacher(message.schedule).teacherWarnings.length,
                   }
                 : undefined
             }
           />
+          {message.requiredPairWarnings && message.requiredPairWarnings.length > 0 && (
+            <div className="copy-module-reply-hint" role="note">
+              <p className="copy-module-reply-hint-title">Required pair warnings</p>
+              <ul className="bubble-list">
+                {message.requiredPairWarnings.map((warning, index) => (
+                  <li key={`${index}-${warning}`}>{warning}</li>
+                ))}
+              </ul>
+            </div>
+          )}
           {message.copymodule === 'yes' && (
             <div className="copy-module-reply-hint" role="note">
               <p className="copy-module-reply-hint-title">Need every student on the schedule?</p>
@@ -3018,7 +3506,29 @@ export default function App() {
         </>
       );
     }
-    return <p className="bubble-text">{message.text}</p>;
+    return (
+      <>
+        <p className="bubble-text">{message.text}</p>
+        {message.pendingStateHint ? (
+          <p className="copy-module-reply-hint-body">{message.pendingStateHint}</p>
+        ) : null}
+        {message.quickReplies && message.quickReplies.length > 0 ? (
+          <div className="bubble-actions">
+            {message.quickReplies.map((reply) => (
+              <button
+                key={reply.message}
+                type="button"
+                className="btn btn-outline btn-sm"
+                disabled={loading}
+                onClick={() => void sendMessage(reply.message)}
+              >
+                {reply.label}
+              </button>
+            ))}
+          </div>
+        ) : null}
+      </>
+    );
   }
 
   if (scheduleFullView) {
@@ -3142,6 +3652,13 @@ export default function App() {
           saving={savingSchedule}
           onCancel={closeUnplacedSaveWarningModal}
           onConfirmSave={confirmUnplacedSaveAnyway}
+        />
+      )}
+      {placementIssuesSaveWarning && (
+        <PlacementIssuesSaveWarningModal
+          saving={savingSchedule}
+          onCancel={closePlacementIssuesSaveWarningModal}
+          onConfirmSave={confirmPlacementIssuesSaveAnyway}
         />
       )}
     </main>

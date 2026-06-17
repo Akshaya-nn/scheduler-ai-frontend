@@ -1,6 +1,6 @@
 # Star Academy AI Scheduler — Frontend
 
-A Vite + React + TypeScript single‑page app that provides a chat‑style interface to the **AI Rotational Scheduler** backend (`star-academy-ai-scheduler`). Users converse with the assistant to pick a class, students, a schedule type, modules, rotation count / pairing options, and finally receive a generated rotation grid.
+A Vite + React + TypeScript single‑page app that provides a chat‑style interface to the **AI Rotational Scheduler** backend (`star-academy-ai-scheduler`). Users converse with the assistant to pick a class, students, a schedule type, modules, rotation count, and finally receive a generated rotation grid.
 
 ---
 
@@ -94,7 +94,6 @@ type ApiResponse = {
     | 'awaiting_modules'
     | 'awaiting_rotation_count'
     | 'awaiting_rotation_capacity_decision'
-    | 'awaiting_pairing'
     | 'ready_to_generate'
     | 'completed';
   assistantMessage: string;                 // free-form text from the LLM
@@ -175,7 +174,6 @@ Once `active`, the backend’s `step` field drives UI affordances:
 | `awaiting_modules` (content sub‑step)   | Render a **numbered checkbox list** of modules/expedition items, with a “Selected” column showing items already on the current schedule, plus a **Copy module** toggle. |
 | `awaiting_rotation_count`               | No picker — user answers with a number in the chat (e.g. `3 rotations`).                                                                                                |
 | `awaiting_rotation_capacity_decision`   | No picker — user answers yes/no about capacity adjustments.                                                                                                             |
-| `awaiting_pairing`                      | No picker — user answers yes/no about pairing.                                                                                                                          |
 | `ready_to_generate`                     | Assistant asks for confirmation to generate. User replies `yes`.                                                                                                        |
 | `completed`                             | `response.schedule` is rendered as a **table** under the chat. The grid is also persisted in `persistedSchedule` so subsequent edits don’t wipe it from view.          |
 
@@ -211,7 +209,7 @@ Once `active`, the backend’s `step` field drives UI affordances:
    - `confirmModuleSelection()` sends a JSON **`moduleIds`** array on the request body (no stringified `[...]` in `message`). Optional `copyEachSelectedModule` / `copyModuleCount` match the DTO. The server turns that into an internal comma-separated wire for the graph.
 
 6. **Free‑form conversational steps**
-   - `awaiting_rotation_count`, `awaiting_rotation_capacity_decision`, `awaiting_pairing`, and `ready_to_generate` all use the composer only. The FE just forwards the user’s text to `/session/message`.
+   - `awaiting_rotation_count`, `awaiting_rotation_capacity_decision`, and `ready_to_generate` all use the composer only. The FE just forwards the user’s text to `/session/message`.
 
 7. **Generate → `completed`**
    - Once the backend returns `schedule`, the FE renders it.
@@ -323,9 +321,8 @@ Key effects:
 5. Selects `Regular Modules` (radio) → **Confirm** → backend replies `awaiting_modules` with the actual modules list.
 6. Ticks 5 modules, leaves **Copy module** on → **Confirm** → backend replies `awaiting_rotation_count`.
 7. Types: `5 rotations` → `awaiting_rotation_capacity_decision`.
-8. Types: `yes` → `awaiting_pairing`.
-9. Types: `no` → `ready_to_generate`.
-10. Types: `yes, generate` → backend returns `completed` with a `schedule` — the grid appears below the chat, any warnings are listed above the table, and the composer remains open for further edits (`swap X with Y`, `add module Chemistry`, etc.).
+8. Types: `yes` → `ready_to_generate`.
+9. Types: `yes, generate` → backend returns `completed` with a `schedule` — the grid appears below the chat, any warnings are listed above the table, and the composer remains open for further edits (`swap X with Y`, `add module Chemistry`, etc.).
 
 ---
 

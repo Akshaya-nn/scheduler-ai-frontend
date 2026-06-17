@@ -846,6 +846,53 @@ body { margin: 0; -webkit-font-smoothing: antialiased; }
   max-height: min(320px, 40vh);
 }
 
+.schedule-warning-panel {
+  margin: 0;
+  padding: 10px 14px;
+  border-top: 1px solid rgba(245, 158, 11, 0.25);
+  border-bottom: 1px solid rgba(245, 158, 11, 0.25);
+  background: rgba(245, 158, 11, 0.1);
+}
+
+.schedule-warning-panel-title {
+  margin: 0 0 6px;
+  font-size: 0.84rem;
+  font-weight: 700;
+  letter-spacing: 0.02em;
+  color: #facc15;
+}
+
+.schedule-warning-panel .bubble-list {
+  margin: 0;
+}
+
+.schedule-warning-toggle {
+  margin-top: 8px;
+  padding: 0;
+  border: none;
+  background: transparent;
+  color: #fbbf24;
+  font-size: 0.8rem;
+  font-weight: 600;
+  cursor: pointer;
+  text-decoration: underline;
+}
+
+.schedule-save-warning-chip {
+  border: 1px solid rgba(245, 158, 11, 0.45);
+  background: rgba(245, 158, 11, 0.15);
+  color: #fef3c7;
+  border-radius: 999px;
+  padding: 7px 12px;
+  font-size: 0.8rem;
+  font-weight: 600;
+  cursor: pointer;
+}
+
+.schedule-save-warning-chip:hover {
+  background: rgba(245, 158, 11, 0.22);
+}
+
 .schedule-save-prompt {
   display: flex;
   flex-direction: row;
@@ -1483,6 +1530,7 @@ body { margin: 0; -webkit-font-smoothing: antialiased; }
   }
 
   .schedule-save-actions .btn,
+  .schedule-save-warning-chip,
   .schedule-save-footer .btn-save-schedule {
     width: 100%;
     min-height: 44px;
